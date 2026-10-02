@@ -24,7 +24,7 @@ La propuesta ocupa **28 pines de señales distintos**. TX es la salida que trans
 
 Las señales de armado, orden y confirmación son una reserva inicial; su número definitivo dependerá de los mecanismos.
 
-Esta distribución respalda la disponibilidad de pines indicada en la [respuesta del ejercicio 1.a](../respuestas/ejercicio-1a.md). De las conexiones previstas en la tabla, en el proyecto del ejercicio 1.b se han configurado SPI1, I²C1, las dos salidas CS de sensores y SWD; las demás quedan como previsión del diseño.
+Esta distribución respalda la disponibilidad de pines indicada en la [respuesta del ejercicio 1.a](../respuestas/ejercicio-1a.md). De las conexiones previstas en la tabla, en el [proyecto del ejercicio 1.b](../respuestas/ejercicio-1b.md) se han configurado SPI1, I²C1, las dos salidas CS de sensores y SWD; las demás quedan como previsión del diseño.
 
 ## Fuentes
 
