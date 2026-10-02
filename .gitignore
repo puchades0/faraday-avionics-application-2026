@@ -1,0 +1,6 @@
+# Artefactos de compilación.
+/firmware/**/build/
+
+# Metadatos y archivos temporales de CubeMX.
+/firmware/**/.mxproject
+/firmware/**/mx.scratch
