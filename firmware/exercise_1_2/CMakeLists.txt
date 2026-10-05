@@ -46,12 +46,14 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user sources here
     Drivers/ISM330DHCX/ism330dhcx_reg.c
+    Drivers/H3LIS331DL/h3lis331dl_reg.c
 )
 
 # Add include paths
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined include paths
     Drivers/ISM330DHCX
+    Drivers/H3LIS331DL
 )
 
 # Add project symbols (macros)

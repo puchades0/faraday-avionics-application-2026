@@ -22,6 +22,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "ism330dhcx_reg.h"
+#include "h3lis331dl_reg.h"
 #include "stm32f4xx_hal.h"
 #include "stm32f4xx_hal_def.h"
 #include <string.h>
@@ -37,6 +38,10 @@
 #define IMU_SPI_READ_BIT (1U << 7)
 #define IMU_RESET_TIMEOUT_MS 100U
 #define IMU_BOOT_TIME_MS 10U
+
+#define HIGHG_SPI_READ_BIT  (1U << 7)
+#define HIGHG_SPI_MULTI_BIT (1U << 6)
+#define HIGHG_BOOT_TIME_MS 5U
 
 /* USER CODE END PD */
 
@@ -64,6 +69,16 @@ static int32_t imu_angular_rate_status = 0;
 
 static uint32_t imu_acceleration_time_ms = 0;
 static uint32_t imu_angular_rate_time_ms = 0;
+
+static stmdev_ctx_t highg_ctx = {0};
+
+static int highg_identified = 0;
+static int highg_ready = 0;
+
+static float highg_acceleration_g[3] = {0};
+
+static int32_t highg_acceleration_status = 0;
+static uint32_t highg_acceleration_time_ms = 0;
 
 /* USER CODE END PV */
 
@@ -339,6 +354,206 @@ static int32_t IMU_ReadAngularRate(float angular_rate_dps[3])
     return 1;
 }
 
+static int32_t HIGHG_Read(void *handle, uint8_t reg,
+                          uint8_t *bufp, uint16_t len)
+{
+    SPI_HandleTypeDef *spi = (SPI_HandleTypeDef *)handle;
+    uint8_t command = reg & ~(HIGHG_SPI_READ_BIT | HIGHG_SPI_MULTI_BIT);
+    command = command | HIGHG_SPI_READ_BIT;
+    if (len > 1)
+    {
+      command = command | HIGHG_SPI_MULTI_BIT;
+    }
+    HAL_StatusTypeDef status;
+
+    memset(bufp, 0, len);
+
+    // 1. Seleccionar el acelerómetro de alto rango.
+    HAL_GPIO_WritePin(HIGHG_CS_GPIO_Port, HIGHG_CS_Pin, GPIO_PIN_RESET);
+    // 2. Enviar command y guardar el resultado en status.
+    status = HAL_SPI_Transmit(spi, &command, 1, 5);
+    // 3. Solo si el envío ha ido bien, recibir len bytes
+    //    en bufp y actualizar status.
+    if (status == HAL_OK)
+    {
+      status = HAL_SPI_Receive(spi, bufp, len, 5);
+    }
+
+    // 4. Deseleccionar el acelerómetro de alto rango, aunque haya fallado algo.
+    HAL_GPIO_WritePin(HIGHG_CS_GPIO_Port, HIGHG_CS_Pin, GPIO_PIN_SET);
+    // 5. Devolver 0 si todo ha ido bien; -1 si ha fallado.
+    if (status == HAL_OK)
+    {
+      return 0;
+    }
+    return -1;
+}
+
+static int32_t HIGHG_Write(void *handle, uint8_t reg,
+                           const uint8_t *bufp, uint16_t len)
+{
+    SPI_HandleTypeDef *spi = (SPI_HandleTypeDef *)handle;
+    uint8_t command = reg & ~(HIGHG_SPI_READ_BIT | HIGHG_SPI_MULTI_BIT);
+    if (len > 1)
+    {
+      command |= HIGHG_SPI_MULTI_BIT;
+    }
+    HAL_StatusTypeDef status;
+
+    // 1. Seleccionar el acelerómetro de alto rango.
+    HAL_GPIO_WritePin(HIGHG_CS_GPIO_Port, HIGHG_CS_Pin, GPIO_PIN_RESET);
+    // 2. Enviar command y guardar el resultado en status.
+    status = HAL_SPI_Transmit(spi, &command, 1, 5);
+    // 3. Solo si el envío ha ido bien, transmitir len bytes
+    //    en bufp y actualizar status.
+    if (status == HAL_OK)
+    {
+      status = HAL_SPI_Transmit(spi, bufp, len, 5);
+    }
+
+    // 4. Deseleccionar el acelerómetro de alto rango, aunque haya fallado algo.
+    HAL_GPIO_WritePin(HIGHG_CS_GPIO_Port, HIGHG_CS_Pin, GPIO_PIN_SET);
+    // 5. Devolver 0 si todo ha ido bien; -1 si ha fallado.
+    if (status == HAL_OK)
+    {
+      return 0;
+    }
+    return -1;
+}
+
+// Devuelve 1 si se identifica el acelerómetro de alto rango esperado; 0 si falla la lectura o no coincide.
+static int HIGHG_CheckIdentity(void)
+{
+    uint8_t id = 0;
+    int32_t status;
+
+    // Leer WHO_AM_I mediante la biblioteca de ST, que utiliza nuestra HIGHG_Read.
+    status = h3lis331dl_device_id_get(&highg_ctx, &id);
+
+    // La biblioteca devuelve 0 cuando la lectura termina correctamente.
+    // Además, el identificador recibido debe coincidir con H3LIS331DL_ID (0x32).
+    if (status == 0 && id == H3LIS331DL_ID)
+    {
+      return 1;
+    }
+    return 0;
+}
+
+static int32_t HIGHG_Configure(void)
+{
+    int32_t status;
+
+    // Detener las medidas mientras se configura el sensor.
+    status = h3lis331dl_data_rate_set(&highg_ctx, H3LIS331DL_ODR_OFF);
+    if (status != 0)
+    {
+        return -1;
+    }
+    // Activar BDU.
+    status = h3lis331dl_block_data_update_set(&highg_ctx, PROPERTY_ENABLE);
+    if (status != 0)
+    {
+        return -1;
+    }
+    // Establecer el orden de los bytes, coloca el byte menos significativo en la dirección más baja.
+    status = h3lis331dl_data_format_set(&highg_ctx, H3LIS331DL_LSB_AT_LOW_ADD);
+    if (status != 0)
+    {
+        return -1;
+    }
+    // Desactivar el filtro paso alto.
+    status = h3lis331dl_hp_path_set(&highg_ctx, H3LIS331DL_HP_DISABLE);
+    if (status != 0)
+    {
+        return -1;
+    }
+    // Seleccionar el rango de ±200 g.
+    status = h3lis331dl_full_scale_set(&highg_ctx, H3LIS331DL_200g);
+    if (status != 0)
+    {
+        return -1;
+    }
+    // Habilitar el eje X.
+    status = h3lis331dl_axis_x_data_set(&highg_ctx, PROPERTY_ENABLE);
+    if (status != 0)
+    {
+        return -1;
+    }
+    // Habilitar el eje Y.
+    status = h3lis331dl_axis_y_data_set(&highg_ctx, PROPERTY_ENABLE);
+    if (status != 0)
+    {
+        return -1;
+    }
+    // Habilitar el eje Z.
+    status = h3lis331dl_axis_z_data_set(&highg_ctx, PROPERTY_ENABLE);
+    if (status != 0)
+    {
+        return -1;
+    }
+    // Activar las medidas a la frecuencia escogida de 400 Hz.
+    status = h3lis331dl_data_rate_set(&highg_ctx, H3LIS331DL_ODR_400Hz);
+    if (status != 0)
+    {
+        return -1;
+    }
+
+    return 0;
+}
+
+static int32_t HIGHG_Init(void)
+{
+  // Esperar al arranque del sensor antes de iniciar la comunicación.
+  HAL_Delay(HIGHG_BOOT_TIME_MS);
+  // Se comprueba la identificación del sensor
+  highg_identified = HIGHG_CheckIdentity();
+  if (highg_identified == 0)
+  {
+    return -1;
+  }
+  // Se lleva a cabo la configuración del sensor.
+  if (HIGHG_Configure() != 0)
+  {
+    return -1;
+  }
+  // Si todos los pasos han sido correctos devuelve 0.
+  return 0;
+}
+
+static int32_t HIGHG_ReadAcceleration(float acceleration_g[3])
+{
+    uint8_t data_ready = 0;
+    int16_t raw[3] = {0};
+    int32_t status;
+
+    // 1. Consultar si hay una medida nueva.
+    //    Si falla la consulta, devolver -1.
+    status = h3lis331dl_flag_data_ready_get(&highg_ctx, &data_ready);
+    if (status != 0)
+    {
+        return -1;
+    }
+    // 2. Si no hay una medida nueva, devolver 0.
+    if (data_ready == 0)
+    {
+      return 0;
+    }
+    // 3. Leer los tres ejes en raw.
+    //    Si falla la lectura, devolver -1.
+    status = h3lis331dl_acceleration_raw_get(&highg_ctx, raw);
+    if (status != 0)
+    {
+        return -1;
+    }
+    // 4. Convertir cada eje a g y guardarlo en acceleration_g.
+    for (int i = 0; i < 3; i++)
+    {
+      acceleration_g[i] = h3lis331dl_from_fs200_to_mg(raw[i]) / 1000.0f;
+    }
+    // 5. Devolver 1 para indicar que se ha obtenido una medida nueva.
+    return 1;
+}
+
 /* USER CODE END 0 */
 
 /**
@@ -380,6 +595,13 @@ int main(void)
 
   imu_ready = (IMU_Init() == 0);
 
+  highg_ctx.read_reg = HIGHG_Read;
+  highg_ctx.write_reg = HIGHG_Write;
+  highg_ctx.mdelay = HAL_Delay;
+  highg_ctx.handle = &hspi1;
+
+  highg_ready = (HIGHG_Init() == 0);
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -405,6 +627,18 @@ int main(void)
       if (imu_angular_rate_status == 1)
       {
         imu_angular_rate_time_ms = HAL_GetTick();
+      }
+    }
+
+    // Se comprueba que el acelerómetro de alto rango esté listo.
+    if (highg_ready == 1)
+    {
+      // Se lleva a cabo la lectura de aceleración.
+      highg_acceleration_status = HIGHG_ReadAcceleration(highg_acceleration_g);
+      // En caso de obtener una muestra nueva se actualiza la marca de tiempo.
+      if (highg_acceleration_status == 1)
+      {
+        highg_acceleration_time_ms = HAL_GetTick();
       }
     }
 
