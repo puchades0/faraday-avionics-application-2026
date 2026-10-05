@@ -21,7 +21,10 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "ism330dhcx_reg.h"
+#include "stm32f4xx_hal.h"
+#include "stm32f4xx_hal_def.h"
+#include <string.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -31,6 +34,9 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+#define IMU_SPI_READ_BIT (1U << 7)
+#define IMU_RESET_TIMEOUT_MS 100U
+#define IMU_BOOT_TIME_MS 10U
 
 /* USER CODE END PD */
 
@@ -45,6 +51,19 @@ I2C_HandleTypeDef hi2c1;
 SPI_HandleTypeDef hspi1;
 
 /* USER CODE BEGIN PV */
+static stmdev_ctx_t imu_ctx = {0};
+
+static int imu_identified = 0;
+static int imu_ready = 0;
+
+static float imu_acceleration_g[3] = {0};
+static float imu_angular_rate_dps[3] = {0};
+
+static int32_t imu_acceleration_status = 0;
+static int32_t imu_angular_rate_status = 0;
+
+static uint32_t imu_acceleration_time_ms = 0;
+static uint32_t imu_angular_rate_time_ms = 0;
 
 /* USER CODE END PV */
 
@@ -59,6 +78,266 @@ static void MX_SPI1_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+// Devuelve 1 si se identifica la IMU esperada; 0 si falla la lectura o no coincide.
+static int IMU_CheckIdentity(void)
+{
+    uint8_t id = 0;
+    int32_t status;
+
+    // Leer WHO_AM_I mediante la biblioteca de ST, que utiliza nuestra IMU_Read.
+    status = ism330dhcx_device_id_get(&imu_ctx, &id);
+
+    // La biblioteca devuelve 0 cuando la lectura termina correctamente.
+    // Además, el identificador recibido debe coincidir con el del ISM330DHCX.
+    if (status == 0 && id == ISM330DHCX_ID)
+    {
+      return 1;
+    }
+    return 0;
+}
+
+static int32_t IMU_Read(void *handle, uint8_t reg,
+                        uint8_t *bufp, uint16_t len)
+{
+    SPI_HandleTypeDef *spi = (SPI_HandleTypeDef *)handle;
+    uint8_t command = reg | IMU_SPI_READ_BIT;
+    HAL_StatusTypeDef status;
+
+    memset(bufp, 0, len);
+
+    // 1. Seleccionar la IMU.
+    HAL_GPIO_WritePin(IMU_CS_GPIO_Port, IMU_CS_Pin, GPIO_PIN_RESET);
+    // 2. Enviar command y guardar el resultado en status.
+    status = HAL_SPI_Transmit(spi, &command, 1, 5);
+    // 3. Solo si el envío ha ido bien, recibir len bytes
+    //    en bufp y actualizar status.
+    if (status == HAL_OK)
+    {
+      status = HAL_SPI_Receive(spi, bufp, len, 5);
+    }
+
+    // 4. Deseleccionar la IMU, aunque haya fallado algo.
+    HAL_GPIO_WritePin(IMU_CS_GPIO_Port, IMU_CS_Pin, GPIO_PIN_SET);
+    // 5. Devolver 0 si todo ha ido bien; -1 si ha fallado.
+    if (status == HAL_OK)
+    {
+      return 0;
+    }
+    return -1;
+}
+
+static int32_t IMU_Write(void *handle, uint8_t reg,
+                         const uint8_t *bufp, uint16_t len)
+{
+    SPI_HandleTypeDef *spi = (SPI_HandleTypeDef *)handle;
+    uint8_t command = reg & ~IMU_SPI_READ_BIT;
+    HAL_StatusTypeDef status;
+
+    // 1. Seleccionar la IMU.
+    HAL_GPIO_WritePin(IMU_CS_GPIO_Port, IMU_CS_Pin, GPIO_PIN_RESET);
+    // 2. Enviar command y guardar el resultado en status.
+    status = HAL_SPI_Transmit(spi, &command, 1, 5);
+    // 3. Solo si el envío ha ido bien, transmitir len bytes
+    //    en bufp y actualizar status.
+    if (status == HAL_OK)
+    {
+      status = HAL_SPI_Transmit(spi, bufp, len, 5);
+    }
+
+    // 4. Deseleccionar la IMU, aunque haya fallado algo.
+    HAL_GPIO_WritePin(IMU_CS_GPIO_Port, IMU_CS_Pin, GPIO_PIN_SET);
+    // 5. Devolver 0 si todo ha ido bien; -1 si ha fallado.
+    if (status == HAL_OK)
+    {
+      return 0;
+    }
+    return -1;
+}
+
+static int32_t IMU_Reset(void)
+{
+    uint8_t reset_pending = 1;
+    uint32_t start;
+    int32_t status;
+
+    // 1. Solicitar el reinicio. Si falla la comunicación, devolver -1.
+    status = ism330dhcx_reset_set(&imu_ctx, PROPERTY_ENABLE);
+    if (status != 0)
+    {
+      return -1;
+    }
+    // 2. Guardar el instante en que empieza la espera.
+    start = HAL_GetTick();
+    // 3. Consultar el estado del reinicio hasta que termine,
+    //    falle la comunicación o se agote el tiempo.
+    while (reset_pending != 0)
+    {
+      status = ism330dhcx_reset_get(&imu_ctx, &reset_pending);
+      if (status != 0)
+        {
+          return -1;
+        }
+      if (reset_pending == 0)
+      {
+        return 0;
+      }
+      if (HAL_GetTick() - start >= IMU_RESET_TIMEOUT_MS)
+      {
+        return -1;
+      }
+      HAL_Delay(1);
+    }
+    // 4. Devolver 0 si el reinicio ha terminado correctamente.
+    return 0;
+}
+
+static int32_t IMU_Configure(void)
+{
+    int32_t status;
+
+    // Desactivar la interfaz I2C de la IMU, porque utilizamos SPI.
+    status = ism330dhcx_i2c_interface_set(&imu_ctx, ISM330DHCX_I2C_DISABLE);
+    if (status != 0)
+    {
+        return -1;
+    }
+    // Activar la configuración del dispositivo indicada por ST.
+    status = ism330dhcx_device_conf_set(&imu_ctx, PROPERTY_ENABLE);
+    if (status != 0)
+    {
+        return -1;
+    }
+    // Evitar mezclar los dos bytes de una medida durante su lectura.
+    status = ism330dhcx_block_data_update_set(&imu_ctx, PROPERTY_ENABLE);
+    if (status != 0)
+    {
+        return -1;
+    }
+    // Recibir los bytes de las medidas sin enviar una dirección nueva para cada uno.
+    status = ism330dhcx_auto_increment_set(&imu_ctx, PROPERTY_ENABLE);
+    if (status != 0)
+    {
+        return -1;
+    }
+    // Configurar el rango del acelerómetro a ±16g.
+    status = ism330dhcx_xl_full_scale_set(&imu_ctx, ISM330DHCX_16g);
+    if (status != 0)
+    {
+        return -1;
+    }
+    // Configurar el rango del giróscopo a ±4000 °/s.
+    status = ism330dhcx_gy_full_scale_set(&imu_ctx, ISM330DHCX_4000dps);
+    if (status != 0)
+    {
+        return -1;
+    }
+    // Configurar frecuencia del acelerómetro a 208 Hz.
+    status = ism330dhcx_xl_data_rate_set(&imu_ctx, ISM330DHCX_XL_ODR_208Hz);
+    if (status != 0)
+    {
+        return -1;
+    }
+    // Configurar frecuencia del giróscopo a 208 Hz.
+    status = ism330dhcx_gy_data_rate_set(&imu_ctx, ISM330DHCX_GY_ODR_208Hz);
+    if (status != 0)
+    {
+        return -1;
+    }
+    // Todas las configuraciones han resultado exitosas, devuelve 0.
+    return 0;
+}
+
+static int32_t IMU_Init(void)
+{
+  // Esperar al arranque del sensor antes de iniciar la comunicación.
+  HAL_Delay(IMU_BOOT_TIME_MS);
+  // Se comprueba la identificación del sensor.
+  imu_identified = IMU_CheckIdentity();
+  if (imu_identified == 0)
+  {
+    return -1;
+  }
+  // Se lleva a cabo el Reset del sensor.
+  if (IMU_Reset() != 0)
+  {
+    return -1;
+  }
+  // Se lleva a cabo la configuración del sensor.
+  if (IMU_Configure() != 0)
+  {
+    return -1;
+  }
+  // Si todos los pasos han sido correctos devuelve 0.
+  return 0;
+}
+
+static int32_t IMU_ReadAcceleration(float acceleration_g[3])
+{
+    uint8_t data_ready = 0;
+    int16_t raw[3] = {0};
+    int32_t status;
+
+    // 1. Consultar si hay una medida nueva.
+    //    Si falla la consulta, devolver -1.
+    status = ism330dhcx_xl_flag_data_ready_get(&imu_ctx, &data_ready);
+    if (status != 0)
+    {
+        return -1;
+    }
+    // 2. Si no hay una medida nueva, devolver 0.
+    if (data_ready == 0)
+    {
+      return 0;
+    }
+    // 3. Leer los tres ejes en raw.
+    //    Si falla la lectura, devolver -1.
+    status = ism330dhcx_acceleration_raw_get(&imu_ctx, raw);
+    if (status != 0)
+    {
+        return -1;
+    }
+    // 4. Convertir cada eje a g y guardarlo en acceleration_g.
+    for (int i = 0; i < 3; i++)
+    {
+      acceleration_g[i] = ism330dhcx_from_fs16g_to_mg(raw[i]) / 1000.0f;
+    }
+    // 5. Devolver 1 para indicar que se ha obtenido una medida nueva.
+    return 1;
+}
+
+static int32_t IMU_ReadAngularRate(float angular_rate_dps[3])
+{
+    uint8_t data_ready = 0;
+    int16_t raw[3] = {0};
+    int32_t status;
+
+    // 1. Consultar si hay una medida nueva.
+    //    Si falla la consulta, devolver -1.
+    status = ism330dhcx_gy_flag_data_ready_get(&imu_ctx, &data_ready);
+    if (status != 0)
+    {
+        return -1;
+    }
+    // 2. Si no hay una medida nueva, devolver 0.
+    if (data_ready == 0)
+    {
+      return 0;
+    }
+    // 3. Leer los tres ejes en raw.
+    //    Si falla la lectura, devolver -1.
+    status = ism330dhcx_angular_rate_raw_get(&imu_ctx, raw);
+    if (status != 0)
+    {
+        return -1;
+    }
+    // 4. Convertir cada eje a dps y guardarlo en angular_rate_dps.
+    for (int i = 0; i < 3; i++)
+    {
+      angular_rate_dps[i] = ism330dhcx_from_fs4000dps_to_mdps(raw[i]) / 1000.0f;
+    }
+    // 5. Devolver 1 para indicar que se ha obtenido una medida nueva.
+    return 1;
+}
 
 /* USER CODE END 0 */
 
@@ -94,6 +373,12 @@ int main(void)
   MX_I2C1_Init();
   MX_SPI1_Init();
   /* USER CODE BEGIN 2 */
+  imu_ctx.read_reg = IMU_Read;
+  imu_ctx.write_reg = IMU_Write;
+  imu_ctx.mdelay = HAL_Delay;
+  imu_ctx.handle = &hspi1;
+
+  imu_ready = (IMU_Init() == 0);
 
   /* USER CODE END 2 */
 
@@ -104,6 +389,27 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    // Se comprueba que la IMU esté lista.
+    if (imu_ready == 1)
+    {
+      // Se lleva a cabo la lectura de aceleración.
+      imu_acceleration_status = IMU_ReadAcceleration(imu_acceleration_g);
+      // En caso de obtener una muestra nueva se actualiza la marca de tiempo.
+      if (imu_acceleration_status == 1)
+      {
+        imu_acceleration_time_ms = HAL_GetTick();
+      }
+      // Se lleva a cabo la lectura de velocidad angular.
+      imu_angular_rate_status = IMU_ReadAngularRate(imu_angular_rate_dps);
+      // En caso de obtener una muestra nueva se actualiza la marca de tiempo.
+      if (imu_angular_rate_status == 1)
+      {
+        imu_angular_rate_time_ms = HAL_GetTick();
+      }
+    }
+
+    // Se espera 1 ms antes de la siguiente lectura
+    HAL_Delay(1);
   }
   /* USER CODE END 3 */
 }
@@ -208,8 +514,8 @@ static void MX_SPI1_Init(void)
   hspi1.Init.Mode = SPI_MODE_MASTER;
   hspi1.Init.Direction = SPI_DIRECTION_2LINES;
   hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
-  hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
-  hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
+  hspi1.Init.CLKPolarity = SPI_POLARITY_HIGH;
+  hspi1.Init.CLKPhase = SPI_PHASE_2EDGE;
   hspi1.Init.NSS = SPI_NSS_SOFT;
   hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_16;
   hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
