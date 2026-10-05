@@ -43,6 +43,25 @@
 #define HIGHG_SPI_MULTI_BIT (1U << 6)
 #define HIGHG_BOOT_TIME_MS 5U
 
+#define BARO_I2C_ADDRESS_7BIT 0x28U
+#define BARO_I2C_ADDRESS_HAL (BARO_I2C_ADDRESS_7BIT << 1)
+#define BARO_CMD_SINGLE_MEASUREMENT 0xAAU
+#define BARO_I2C_TIMEOUT_MS 5U
+
+#define BARO_STATUS_BUSY_BIT          (1U << 5)
+#define BARO_STATUS_MEMORY_ERROR_BIT  (1U << 2)
+#define BARO_STATUS_OVERFLOW_BIT      (1U << 0)
+
+#define BARO_STATUS_FIXED_MASK \
+    ((1U << 7) | (1U << 6) | (1U << 4) | (1U << 3))
+#define BARO_STATUS_FIXED_VALUE       (1U << 6)
+
+#define BARO_DIGITAL_SCALE     16777216.0f
+#define BARO_PRESSURE_MAX_HPA   1500.0f
+
+#define BARO_PERIOD_MS 20U
+#define BARO_CONVERSION_WAIT_MS 4U
+#define BARO_MEASUREMENT_TIMEOUT_MS 10U
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -80,6 +99,14 @@ static float highg_acceleration_g[3] = {0};
 static int32_t highg_acceleration_status = 0;
 static uint32_t highg_acceleration_time_ms = 0;
 
+static float baro_pressure_hpa = 0.0f;
+static float baro_temperature_c = 0.0f;
+static int32_t baro_measurement_status = 0;
+static uint32_t baro_measurement_time_ms = 0;
+
+static int baro_measurement_pending = 0;
+static uint32_t baro_last_request_ms = 0;
+static uint32_t baro_measurement_start_ms = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -554,6 +581,206 @@ static int32_t HIGHG_ReadAcceleration(float acceleration_g[3])
     return 1;
 }
 
+static int32_t BARO_StartMeasurement(void)
+{
+    uint8_t command = BARO_CMD_SINGLE_MEASUREMENT;
+    HAL_StatusTypeDef status;
+
+    // Enviar el comando por I2C1 y guardar el resultado en status.
+    status = HAL_I2C_Master_Transmit(&hi2c1, BARO_I2C_ADDRESS_HAL, &command, 1, BARO_I2C_TIMEOUT_MS);
+    // Devolver 0 si el envío funciona; -1 si falla.
+    if (status != HAL_OK)
+    {
+      return -1;
+    }
+    return 0;
+}
+
+static int32_t BARO_ReadStatus(uint8_t *status_byte)
+{
+    HAL_StatusTypeDef status;
+
+    // Leer un byte del barómetro y guardarlo donde apunta status_byte.
+    status = HAL_I2C_Master_Receive(&hi2c1, BARO_I2C_ADDRESS_HAL, status_byte, 1, BARO_I2C_TIMEOUT_MS);
+    // Devolver -1 si falla la comunicación; 0 si funciona.
+    if (status != HAL_OK)
+    {
+      return -1;
+    }
+    return 0;
+}
+
+static int32_t BARO_CheckStatus(uint8_t status_byte)
+{
+    // 1. Comprobar los bits fijos. Si no coinciden, devolver -1.
+    if ((status_byte & BARO_STATUS_FIXED_MASK) != BARO_STATUS_FIXED_VALUE)
+    {
+      return -1;
+    }
+    // 2. Si hay un error de memoria interna, devolver -1.
+    if ((status_byte & BARO_STATUS_MEMORY_ERROR_BIT) != 0U)
+    {
+      return -1;
+    }
+    // 3. Si sigue midiendo, devolver 0.
+    if ((status_byte & BARO_STATUS_BUSY_BIT) != 0U)
+    {
+      return 0;
+    }
+    // 4. Con la medición terminada, si hay desbordamiento, devolver -1.
+    if ((status_byte & BARO_STATUS_OVERFLOW_BIT) != 0U)
+    {
+      return -1;
+    }
+    // 5. Devolver 1: medición terminada sin los errores comprobados.
+    return 1;
+}
+
+static int32_t BARO_ReadRaw(uint32_t *pressure_raw,
+                           uint32_t *temperature_raw)
+{
+    uint8_t data[7] = {0};
+    HAL_StatusTypeDef status;
+    int32_t measurement_status;
+
+    // 1. Recibir los siete bytes mediante HAL_I2C_Master_Receive.
+    status = HAL_I2C_Master_Receive(&hi2c1, BARO_I2C_ADDRESS_HAL, data, 7, BARO_I2C_TIMEOUT_MS);
+    // 2. Si falla la comunicación, devolver -1.
+    if (status != HAL_OK)
+    {
+      return -1;
+    }
+    // 3. Comprobar data[0] utilizando BARO_CheckStatus.
+    //    Guardar su resultado en measurement_status.
+    measurement_status = BARO_CheckStatus(data[0]);
+    // 4. Si measurement_status no es 1, devolver ese resultado.
+    if (measurement_status != 1)
+    {
+      return measurement_status;
+    }
+    // 5. Construir los valores de presión y temperatura
+    //    y guardarlos mediante los punteros de salida.
+    *pressure_raw = ((uint32_t)data[1] << 16)
+             | ((uint32_t)data[2] << 8)
+             | (uint32_t)data[3];
+    *temperature_raw = ((uint32_t)data[4] << 16)
+             | ((uint32_t)data[5] << 8)
+             | (uint32_t)data[6];
+    // 6. Devolver 1.
+    return 1;
+}
+
+static int32_t BARO_ReadMeasurements(float *pressure_hpa,
+                                    float *temperature_c)
+{
+    uint32_t pressure_raw = 0;
+    uint32_t temperature_raw = 0;
+    int32_t status;
+
+    // 1. Llamar a BARO_ReadRaw pasando las direcciones
+    //    de pressure_raw y temperature_raw.
+    status = BARO_ReadRaw(&pressure_raw, &temperature_raw);
+    // 2. Si su resultado no es 1, devolver ese resultado.
+    if (status != 1)
+    {
+      return status;
+    }
+    // 3. Convertir pressure_raw a hPa y escribir
+    //    el resultado donde apunta pressure_hpa.
+    *pressure_hpa = ((float)pressure_raw - 0.1f * BARO_DIGITAL_SCALE) / (0.8f * BARO_DIGITAL_SCALE) * BARO_PRESSURE_MAX_HPA;
+    // 4. Convertir temperature_raw a grados Celsius y escribir
+    //    el resultado donde apunta temperature_c.
+    *temperature_c = (float)temperature_raw / BARO_DIGITAL_SCALE * 165.0f - 40.0f;
+    // 5. Devolver 1.
+    return 1;
+}
+
+static void BARO_Update(void)
+{
+    uint32_t now = HAL_GetTick();
+
+    if (baro_measurement_pending == 0)
+    {
+        // 1. Si aún no han transcurrido BARO_PERIOD_MS
+        //    desde baro_last_request_ms, salir con return.
+        if ((uint32_t)(now - baro_last_request_ms) < BARO_PERIOD_MS)
+        {
+          return;
+        }
+        // 2. Guardar now en baro_last_request_ms.
+        baro_last_request_ms = now;
+        // 3. Llamar a BARO_StartMeasurement.
+        //    Si falla, poner baro_measurement_status a -1 y salir.
+        if (BARO_StartMeasurement() != 0)
+        {
+          baro_measurement_status = -1;
+          return;
+        }
+        // 4. Si funciona:
+        //    - Guardar HAL_GetTick() en baro_measurement_start_ms.
+        //    - Poner baro_measurement_pending a 1.
+        //    - Poner baro_measurement_status a 0.
+        baro_measurement_start_ms = HAL_GetTick();
+        baro_measurement_pending = 1;
+        baro_measurement_status = 0;
+    }
+    else
+    {
+        uint8_t sensor_status = 0;
+
+        // 1. Si aún no han pasado BARO_CONVERSION_WAIT_MS
+        //    desde baro_measurement_start_ms, salir.
+        if ((uint32_t)(now - baro_measurement_start_ms) < BARO_CONVERSION_WAIT_MS)
+        {
+          return;
+        }
+        // 2. Leer el byte de estado con BARO_ReadStatus.
+        //    Si falla:
+        //    - Poner baro_measurement_status a -1.
+        //    - Poner baro_measurement_pending a 0.
+        //    - Salir.
+        if (BARO_ReadStatus(&sensor_status) != 0)
+        {
+          baro_measurement_status = -1;
+          baro_measurement_pending = 0;
+          return;
+
+        }
+        // 3. Interpretar sensor_status con BARO_CheckStatus
+        //    y guardar el resultado en baro_measurement_status.
+        baro_measurement_status = BARO_CheckStatus(sensor_status);
+        // 4. Si ese resultado es 1, llamar a BARO_ReadMeasurements
+        //    pasando las direcciones de baro_pressure_hpa
+        //    y baro_temperature_c.
+        //    Guardar su resultado en baro_measurement_status.
+        if (baro_measurement_status == 1)
+        {
+          baro_measurement_status = BARO_ReadMeasurements(&baro_pressure_hpa, &baro_temperature_c);
+        }
+        // 5. Si baro_measurement_status es 1,
+        //    actualizar baro_measurement_time_ms con HAL_GetTick().
+        if (baro_measurement_status == 1)
+        {
+          baro_measurement_time_ms = HAL_GetTick();
+        }
+        // 6. Si baro_measurement_status es distinto de 0:
+        //    - Poner baro_measurement_pending a 0.
+        //    - Salir.
+        if (baro_measurement_status != 0)
+        {
+          baro_measurement_pending = 0;
+          return;
+        }
+        // 7. Si seguimos esperando y se ha alcanzado el timeout:
+        //    - Poner baro_measurement_status a -1.
+        //    - Poner baro_measurement_pending a 0.
+        if ((uint32_t)(HAL_GetTick() - baro_measurement_start_ms) >= BARO_MEASUREMENT_TIMEOUT_MS)
+        {
+          baro_measurement_status = -1;
+          baro_measurement_pending = 0;
+        }
+    }
+}
 /* USER CODE END 0 */
 
 /**
@@ -602,6 +829,7 @@ int main(void)
 
   highg_ready = (HIGHG_Init() == 0);
 
+  baro_last_request_ms = HAL_GetTick();
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -641,6 +869,9 @@ int main(void)
         highg_acceleration_time_ms = HAL_GetTick();
       }
     }
+
+    // Se gestiona la adquisición de medidas del barómetro.
+    BARO_Update();
 
     // Se espera 1 ms antes de la siguiente lectura
     HAL_Delay(1);
