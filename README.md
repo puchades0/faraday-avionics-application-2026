@@ -5,6 +5,7 @@ Prueba de acceso a Faraday Rocketry UPV (Equipo de Aviónica Software, 2026-27).
 
 - [Ejercicio 1.a: respuesta integrada — selección del STM32F411RE](respuestas/ejercicio-1a.md).
 - [Ejercicio 1.b: configuración del proyecto en STM32CubeMX](respuestas/ejercicio-1b.md).
+- [Ejercicio 2.a: selección de sensores y actualización del presupuesto](respuestas/ejercicio-2a.md).
 
 ## Anexo
 
