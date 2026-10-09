@@ -25,10 +25,13 @@
 #include "h3lis331dl_reg.h"
 #include "stm32f411xe.h"
 #include "stm32f4xx_hal.h"
+#include "stm32f4xx_hal_adc.h"
+#include "stm32f4xx_hal_adc_ex.h"
 #include "stm32f4xx_hal_def.h"
 #include "stm32f4xx_hal_dma.h"
 #include "stm32f4xx_hal_flash_ex.h"
 #include "stm32f4xx_hal_uart.h"
+#include "stm32f4xx_ll_adc.h"
 #include <stdint.h>
 #include <string.h>
 /* USER CODE END Includes */
@@ -152,6 +155,20 @@ typedef struct
 #define GNSS_STARTUP_ATTEMPTS 3U
 #define GNSS_STARTUP_RETRY_MS 200U
 
+// ADC de 12 bits: espera de conversión y máximo código digital.
+#define ADC_CONVERSION_TIMEOUT_MS 2U
+#define ADC_MAX_VALUE 4095U
+
+// Periodos solicitados: alimentación a 10 Hz y temperatura interna a 1 Hz.
+#define POWER_READ_PERIOD_MS       100U
+#define TEMPERATURE_READ_PERIOD_MS 1000U
+
+// Factores de los divisores resistivos de ejemplo para el ejercicio
+// En la realidad deben corresponder a los divisores de la placa.
+#define BATTERY_DIVIDER_FACTOR     4.0f
+#define RAIL1_DIVIDER_FACTOR       2.0f
+#define RAIL2_DIVIDER_FACTOR       2.0f
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -160,6 +177,8 @@ typedef struct
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+ADC_HandleTypeDef hadc1;
+
 I2C_HandleTypeDef hi2c1;
 
 SPI_HandleTypeDef hspi1;
@@ -243,6 +262,24 @@ static int32_t gnss_ack_result = 0;
 // Veces que la recepción ha alcanzado o superado la capacidad del búfer.
 static uint32_t gnss_rx_overflow_count = 0;
 
+// Últimas medidas del ADC: VDDA y líneas en voltios; temperatura interna en °C.
+static float adc_vdda_v = 0.0f;
+static float battery_voltage_v = 0.0f;
+static float rail1_voltage_v = 0.0f;
+static float rail2_voltage_v = 0.0f;
+static float mcu_temperature_c = 0.0f;
+
+// Estado de cada adquisición: 0 = todavía no realizada, 1 = correcta, -1 = fallida.
+static int32_t power_measurement_status = 0;
+static int32_t temperature_measurement_status = 0;
+
+// Instantes de solicitud para programar los periodos de lectura.
+static uint32_t power_last_request_ms = 0;
+static uint32_t temperature_last_request_ms = 0;
+
+// Instantes de las últimas adquisiciones correctas; no avanzan si una lectura falla.
+static uint32_t power_measurement_time_ms = 0;
+static uint32_t temperature_measurement_time_ms = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -252,6 +289,7 @@ static void MX_DMA_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_SPI1_Init(void);
 static void MX_USART1_UART_Init(void);
+static void MX_ADC1_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -1729,6 +1767,192 @@ static void GNSS_Update(void)
     }
 }
 
+// Configura un canal del ADC y realiza una conversión de 12 bits con espera limitada.
+// Devuelve 0 si escribe la lectura en raw y -1 si falla; conserva la salida si hay error.
+static int32_t ADC_ReadRaw(uint32_t channel, uint16_t *raw)
+{
+    ADC_ChannelConfTypeDef config = {0};
+    HAL_StatusTypeDef status;
+    HAL_StatusTypeDef stop_status;
+    uint32_t value = 0;
+
+    if (raw == NULL)
+    {
+      return -1;
+    }
+    config.Channel = channel;
+    config.Rank = 1;
+    // A 25 MHz, 480 ciclos dan 19,2 us de muestreo para las entradas internas.
+    config.SamplingTime = ADC_SAMPLETIME_480CYCLES;
+    status = HAL_ADC_ConfigChannel(&hadc1, &config);
+    if (status != HAL_OK)
+    {
+      return -1;
+    }
+    status = HAL_ADC_Start(&hadc1);
+    if (status != HAL_OK)
+    {
+      return -1;
+    }
+    status = HAL_ADC_PollForConversion(&hadc1, ADC_CONVERSION_TIMEOUT_MS);
+    if (status == HAL_OK)
+    {
+      value = HAL_ADC_GetValue(&hadc1);
+    }
+    // Detener el ADC también si la espera terminó con error.
+    stop_status = HAL_ADC_Stop(&hadc1);
+    if (status != HAL_OK || stop_status != HAL_OK)
+    {
+      return -1;
+    }
+    *raw = (uint16_t)value;
+    return 0;
+}
+
+// Estima VDDA en voltios con VREFINT y su calibración de fábrica.
+// Devuelve 0 si publica el resultado y -1 si falla la lectura o los valores comprobados.
+static int32_t ADC_ReadSupplyVoltage(float *vdda_v)
+{
+    uint16_t raw;
+    uint16_t calibration;
+
+    if (vdda_v == NULL)
+    {
+      return -1;
+    }
+    if (ADC_ReadRaw(ADC_CHANNEL_VREFINT, &raw) != 0)
+    {
+      return -1;
+    }
+    calibration = *VREFINT_CAL_ADDR;
+    // Evitar división por cero y rechazar valores nulos o en el máximo digital.
+    if (raw == 0 || calibration == 0 ||
+        raw >= ADC_MAX_VALUE || calibration >= ADC_MAX_VALUE)
+    {
+      return -1;
+    }
+    // La calibración corresponde a 3,3 V; la lectura de VREFINT varía inversamente con VDDA.
+    *vdda_v = ((float)VREFINT_CAL_VREF / 1000.0f) * ((float)calibration / raw);
+    return 0;
+}
+
+// Convierte la lectura de un canal a voltios de la línea, usando VDDA y su divisor.
+// Devuelve 0 si publica el resultado y -1 por error, argumento inválido o fondo de escala.
+static int32_t ADC_ReadVoltage(uint32_t channel,
+                              float vdda_v,
+                              float divider_factor,
+                              float *voltage_v)
+{
+    uint16_t raw;
+
+    if (voltage_v == NULL)
+    {
+      return -1;
+    }
+    if (vdda_v <= 0 || divider_factor < 1)
+    {
+      return -1;
+    }
+    if (ADC_ReadRaw(channel, &raw) != 0)
+    {
+      return -1;
+    }
+    // En el máximo digital no se puede distinguir una tensión en el límite de una saturación.
+    if (raw >= ADC_MAX_VALUE)
+    {
+      return -1;
+    }
+    *voltage_v = (float)raw / ADC_MAX_VALUE * vdda_v * divider_factor;
+    return 0;
+}
+
+// Calcula la temperatura interna del STM32 en °C con sus dos calibraciones de fábrica.
+// Corrige la lectura según VDDA. Devuelve 0 si publica el resultado y -1 si falla.
+static int32_t ADC_ReadTemperature(float vdda_v, float *temperature_c)
+{
+    uint16_t raw;
+    uint16_t calibration1;
+    uint16_t calibration2;
+    float corrected_raw;
+
+    if (temperature_c == NULL || vdda_v <= 0)
+    {
+      return -1;
+    }
+    if (ADC_ReadRaw(ADC_CHANNEL_TEMPSENSOR, &raw) != 0)
+    {
+      return -1;
+    }
+    calibration1 = *TEMPSENSOR_CAL1_ADDR;
+    calibration2 = *TEMPSENSOR_CAL2_ADDR;
+    if (raw == 0 || calibration1 == 0 || calibration2 == 0 ||
+        raw >= ADC_MAX_VALUE || calibration1 >= ADC_MAX_VALUE || calibration2 >= ADC_MAX_VALUE ||
+        calibration1 == calibration2)
+    {
+      return -1;
+    }
+    // Llevar la lectura a la tensión de calibración antes de interpolar entre 30 y 110 °C.
+    corrected_raw = (float)raw * vdda_v / ((float)TEMPSENSOR_CAL_VREFANALOG / 1000.0f);
+    *temperature_c = TEMPSENSOR_CAL1_TEMP
+                   + (corrected_raw - calibration1)
+                   / ((float)calibration2 - calibration1)
+                   * (TEMPSENSOR_CAL2_TEMP - TEMPSENSOR_CAL1_TEMP);
+    return 0;
+}
+
+// Solicita alimentación cada 100 ms y temperatura cada 1000 ms, según las constantes.
+// Publica las tensiones juntas solo si todas se leen; la temperatura se evalúa aparte.
+// Conserva valores y marcas de tiempo anteriores si falla una adquisición.
+static void ADC_Update(void)
+{
+    uint32_t now = HAL_GetTick();
+    int32_t vdda_status;
+
+    float vdda_v;
+    float battery_v;
+    float rail1_v;
+    float rail2_v;
+    float temperature_c;
+
+    if (now - power_last_request_ms < POWER_READ_PERIOD_MS)
+    {
+      return;
+    }
+    power_last_request_ms = now;
+    vdda_status = ADC_ReadSupplyVoltage(&vdda_v);
+    // Publicar el conjunto solo cuando VDDA y las tres líneas se han leído correctamente.
+    power_measurement_status = -1;
+    if (vdda_status == 0 &&
+        ADC_ReadVoltage(ADC_CHANNEL_10, vdda_v, BATTERY_DIVIDER_FACTOR, &battery_v) == 0 &&
+        ADC_ReadVoltage(ADC_CHANNEL_11, vdda_v, RAIL1_DIVIDER_FACTOR, &rail1_v) == 0&&
+        ADC_ReadVoltage(ADC_CHANNEL_12, vdda_v, RAIL2_DIVIDER_FACTOR, &rail2_v) == 0)
+    {
+      adc_vdda_v = vdda_v;
+      battery_voltage_v = battery_v;
+      rail1_voltage_v = rail1_v;
+      rail2_voltage_v = rail2_v;
+      power_measurement_time_ms = HAL_GetTick();
+      power_measurement_status = 1;
+    }
+    // Reevaluar el tiempo después de las lecturas de tensión.
+    // La temperatura puede leerse aunque falle una línea, siempre que VDDA sea válida.
+    now = HAL_GetTick();
+    if (now - temperature_last_request_ms >= TEMPERATURE_READ_PERIOD_MS)
+    {
+      temperature_last_request_ms = now;
+      temperature_measurement_status = -1;
+      if (vdda_status == 0)
+      {
+        if (ADC_ReadTemperature(vdda_v, &temperature_c) == 0)
+        {
+          mcu_temperature_c = temperature_c;
+          temperature_measurement_time_ms = HAL_GetTick();
+          temperature_measurement_status = 1;
+        }
+      }
+    }
+}
+
 /* USER CODE END 0 */
 
 /**
@@ -1764,7 +1988,13 @@ int main(void)
   MX_I2C1_Init();
   MX_SPI1_Init();
   MX_USART1_UART_Init();
+  MX_ADC1_Init();
   /* USER CODE BEGIN 2 */
+
+  // Habilitar la referencia interna y el sensor de temperatura del ADC.
+  SET_BIT(ADC->CCR, ADC_CCR_TSVREFE);
+  // Esperar a que los circuitos internos se estabilicen.
+  HAL_Delay(1);
 
   // Completar la configuración del GNSS antes de iniciar las medidas inerciales.
   gnss_last_restart_ms = HAL_GetTick();
@@ -1794,6 +2024,8 @@ int main(void)
 
   // Iniciar los periodos de adquisición al terminar la configuración.
   baro_last_request_ms = HAL_GetTick();
+  power_last_request_ms = baro_last_request_ms;
+  temperature_last_request_ms = baro_last_request_ms;
 
   /* USER CODE END 2 */
 
@@ -1841,6 +2073,8 @@ int main(void)
     // Se procesan los datos del GNSS y se supervisa la recepción.
     GNSS_Update();
 
+    // Actualizar las medidas de alimentación y temperatura.
+    ADC_Update();
   }
   /* USER CODE END 3 */
 }
@@ -1889,6 +2123,58 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
+}
+
+/**
+  * @brief ADC1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_ADC1_Init(void)
+{
+
+  /* USER CODE BEGIN ADC1_Init 0 */
+
+  /* USER CODE END ADC1_Init 0 */
+
+  ADC_ChannelConfTypeDef sConfig = {0};
+
+  /* USER CODE BEGIN ADC1_Init 1 */
+
+  /* USER CODE END ADC1_Init 1 */
+
+  /** Configure the global features of the ADC (Clock, Resolution, Data Alignment and number of conversion)
+  */
+  hadc1.Instance = ADC1;
+  hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV4;
+  hadc1.Init.Resolution = ADC_RESOLUTION_12B;
+  hadc1.Init.ScanConvMode = DISABLE;
+  hadc1.Init.ContinuousConvMode = DISABLE;
+  hadc1.Init.DiscontinuousConvMode = DISABLE;
+  hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
+  hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+  hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+  hadc1.Init.NbrOfConversion = 1;
+  hadc1.Init.DMAContinuousRequests = DISABLE;
+  hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+  if (HAL_ADC_Init(&hadc1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure for the selected ADC regular channel its corresponding rank in the sequencer and its sample time.
+  */
+  sConfig.Channel = ADC_CHANNEL_10;
+  sConfig.Rank = 1;
+  sConfig.SamplingTime = ADC_SAMPLETIME_480CYCLES;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN ADC1_Init 2 */
+
+  /* USER CODE END ADC1_Init 2 */
+
 }
 
 /**
@@ -2025,6 +2311,7 @@ static void MX_GPIO_Init(void)
   /* USER CODE END MX_GPIO_Init_1 */
 
   /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
