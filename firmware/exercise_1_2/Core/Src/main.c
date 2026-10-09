@@ -23,14 +23,45 @@
 /* USER CODE BEGIN Includes */
 #include "ism330dhcx_reg.h"
 #include "h3lis331dl_reg.h"
+#include "stm32f411xe.h"
 #include "stm32f4xx_hal.h"
 #include "stm32f4xx_hal_def.h"
+#include "stm32f4xx_hal_dma.h"
+#include "stm32f4xx_hal_flash_ex.h"
+#include "stm32f4xx_hal_uart.h"
+#include <stdint.h>
 #include <string.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
+// Datos NAV-PVT convertidos a unidades físicas; se publican juntos al decodificar el mensaje.
+typedef struct
+{
+    double longitude_deg;
+    double latitude_deg;
 
+    // Altura respecto al nivel medio del mar, no respecto al punto de lanzamiento.
+    float height_msl_m;
+
+    float velocity_north_mps;
+    float velocity_east_mps;
+    float velocity_up_mps;
+
+    // Estimaciones de error proporcionadas por el receptor.
+    float horizontal_accuracy_m;
+    float vertical_accuracy_m;
+    float speed_accuracy_mps;
+
+    // Época GNSS en ms de la semana e instante de procesamiento en el reloj del STM32.
+    uint32_t time_of_week_ms;
+    uint32_t reception_time_ms;
+
+    uint8_t fix_type;
+    uint8_t satellites;
+    // Validez por indicadores y coordenadas; GNSS_Update también comprueba la antigüedad.
+    uint8_t fix_valid;
+} GNSS_Data_t;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -62,6 +93,65 @@
 #define BARO_PERIOD_MS 20U
 #define BARO_CONVERSION_WAIT_MS 4U
 #define BARO_MEASUREMENT_TIMEOUT_MS 10U
+
+// Capacidad del DMA circular y del mensaje UBX en reconstrucción, en bytes.
+#define GNSS_RX_BUFFER_SIZE 512U
+#define GNSS_MESSAGE_BUFFER_SIZE 128U
+
+// Tipo de solución y máscaras de validez de NAV-PVT.
+#define GNSS_FIX_TYPE_3D       3U
+#define GNSS_FIX_OK_BIT        (1U << 0)
+#define GNSS_INVALID_LLH_BIT   (1U << 0)
+
+// Limitar el trabajo de cada pasada para poder atender los otros sensores.
+#define GNSS_MAX_BYTES_PER_UPDATE 128U
+
+// Intervalo entre reinicios de recepción y antigüedad máxima admitida, en milisegundos.
+#define GNSS_RETRY_PERIOD_MS 1000U
+#define GNSS_DATA_TIMEOUT_MS 500U
+
+// Capacidad de la trama transmitida y espera máxima de transmisión.
+#define GNSS_TX_BUFFER_SIZE 128U
+#define GNSS_TX_TIMEOUT_MS 200U
+
+// Tiempo máximo para recibir la aceptación o el rechazo de una orden.
+#define GNSS_ACK_TIMEOUT_MS 1500U
+
+// Claves CFG-VALSET del protocolo u-blox M10 y valor del modelo Airborne <4g.
+#define GNSS_CFG_NAVSPG_DYNMODEL 0x20110021U
+#define GNSS_DYNMODEL_AIRBORNE_4G 8U
+
+// Selección de protocolos de salida y frecuencia del mensaje NAV-PVT en UART1.
+#define GNSS_CFG_UART1OUTPROT_UBX       0x10740001U
+#define GNSS_CFG_UART1OUTPROT_NMEA      0x10740002U
+#define GNSS_CFG_MSGOUT_NAV_PVT_UART1   0x20910007U
+
+// Claves para seleccionar las constelaciones y sus señales.
+#define GNSS_CFG_SIGNAL_SBAS_ENA       0x10310020U
+#define GNSS_CFG_SIGNAL_BDS_ENA        0x10310022U
+#define GNSS_CFG_SIGNAL_QZSS_ENA        0x10310024U
+#define GNSS_CFG_SIGNAL_GLO_ENA        0x10310025U
+#define GNSS_CFG_SIGNAL_GPS_ENA        0x1031001FU
+#define GNSS_CFG_SIGNAL_GPS_L1CA_ENA   0x10310001U
+#define GNSS_CFG_SIGNAL_GAL_ENA        0x10310021U
+#define GNSS_CFG_SIGNAL_GAL_E1_ENA     0x10310007U
+
+// Claves del periodo de medida, soluciones de navegación y velocidad UART.
+#define GNSS_CFG_RATE_MEAS             0x30210001U
+#define GNSS_CFG_RATE_NAV              0x30210002U
+#define GNSS_CFG_UART1_BAUDRATE        0x40520001U
+
+// Espera adicional al ACK tras modificar la selección de señales GNSS.
+#define GNSS_SIGNAL_SETTLE_MS          500U
+
+// Velocidad final en bit/s y espera durante el cambio de velocidad.
+#define GNSS_UART_BAUDRATE       115200U
+#define GNSS_BAUD_SETTLE_MS      1500U
+
+// Intentos por velocidad durante el arranque y pausa entre intentos fallidos.
+#define GNSS_STARTUP_ATTEMPTS 3U
+#define GNSS_STARTUP_RETRY_MS 200U
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -73,6 +163,9 @@
 I2C_HandleTypeDef hi2c1;
 
 SPI_HandleTypeDef hspi1;
+
+UART_HandleTypeDef huart1;
+DMA_HandleTypeDef hdma_usart1_rx;
 
 /* USER CODE BEGIN PV */
 static stmdev_ctx_t imu_ctx = {0};
@@ -107,13 +200,58 @@ static uint32_t baro_measurement_time_ms = 0;
 static int baro_measurement_pending = 0;
 static uint32_t baro_last_request_ms = 0;
 static uint32_t baro_measurement_start_ms = 0;
+
+// Recepción GNSS: el DMA escribe el array y el bucle retira los bytes.
+// volatile se usa en los indicadores y contadores compartidos con interrupciones.
+static uint8_t gnss_rx_buffer[GNSS_RX_BUFFER_SIZE] = {0};
+static volatile uint8_t gnss_rx_event = 0;
+static uint16_t gnss_rx_read_position = 0;
+
+// Vueltas completas realizadas por el DMA desde el inicio de la recepción.
+static volatile uint32_t gnss_rx_completed_buffers = 0;
+
+// Bytes retirados del búfer desde el inicio de la recepción.
+static uint32_t gnss_rx_read_count = 0;
+
+// Trama UBX en reconstrucción: bytes acumulados, tamaño esperado y tamaño de la última válida.
+static uint8_t gnss_message_buffer[GNSS_MESSAGE_BUFFER_SIZE] = {0};
+static uint16_t gnss_message_count = 0;
+static uint16_t gnss_expected_length = 0;
+static uint16_t gnss_message_length = 0;
+
+// Último NAV-PVT decodificado; consultar fix_valid antes de utilizar sus datos.
+static GNSS_Data_t gnss_data = {0};
+
+// Mensajes rechazados por formato, longitud o checksum; se conserva tras reiniciar la recepción.
+static uint32_t gnss_message_errors = 0;
+
+// Solicitud de recuperación por error UART o llenado del búfer; último error HAL para diagnóstico.
+static volatile uint8_t gnss_rx_error_pending = 0;
+static volatile uint32_t gnss_rx_last_error = HAL_UART_ERROR_NONE;
+
+// Estado de recepción, instante del último intento de recuperación y configuración completada.
+static int gnss_rx_ready = 0;
+static uint32_t gnss_last_restart_ms = 0;
+static int gnss_configured = 0;
+
+// Confirmación de la orden en curso: clase/ID esperados y resultado (0 pendiente, 1 ACK, -1 NAK).
+static int gnss_ack_waiting = 0;
+static uint8_t gnss_ack_expected_class = 0;
+static uint8_t gnss_ack_expected_id = 0;
+static int32_t gnss_ack_result = 0;
+
+// Veces que la recepción ha alcanzado o superado la capacidad del búfer.
+static uint32_t gnss_rx_overflow_count = 0;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_SPI1_Init(void);
+static void MX_USART1_UART_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -781,6 +919,816 @@ static void BARO_Update(void)
         }
     }
 }
+// Inicia USART1 con DMA circular y avisos de recepción.
+// Devuelve 0 si se inicia y -1 si falla; la UART y el DMA deben estar configurados.
+static int32_t GNSS_StartReception(void)
+{
+    HAL_StatusTypeDef status;
+
+    status = HAL_UARTEx_ReceiveToIdle_DMA(&huart1, gnss_rx_buffer, GNSS_RX_BUFFER_SIZE);
+    if (status != HAL_OK)
+    {
+      return -1;
+    }
+    return 0;
+}
+
+// Invalida la solución, detiene la recepción y reinicia los contadores y el mensaje parcial.
+// Conserva los contadores de diagnóstico. Devuelve 0 al reiniciar y -1 si falla.
+static int32_t GNSS_RestartReception(void)
+{
+    gnss_data.fix_valid = 0;
+    if (HAL_UART_AbortReceive(&huart1) != HAL_OK)
+    {
+      return -1;
+    }
+    __HAL_UART_CLEAR_OREFLAG(&huart1);
+
+    // Reiniciar los contadores solo después de detener el DMA.
+    gnss_rx_read_position = 0;
+    gnss_message_count = 0;
+    gnss_expected_length = 0;
+    gnss_message_length = 0;
+    gnss_rx_event = 0;
+    gnss_rx_error_pending = 0;
+    gnss_rx_completed_buffers = 0;
+    gnss_rx_read_count = 0;
+    return GNSS_StartReception();
+}
+
+// Obtiene el total de bytes recibidos desde el último inicio, con aritmética uint32_t.
+// Se llama desde el programa principal. Combina vueltas completas y posición del DMA.
+// El contador requiere atender las interrupciones de DMA antes de que pase otra vuelta.
+static uint32_t GNSS_GetReceivedCount(void)
+{
+  uint32_t interrupt_state;
+  uint32_t completed_buffers;
+  uint32_t remaining;
+
+  // Leer una instantánea sin que el callback modifique el contador de vueltas.
+  // El DMA continúa escribiendo durante este breve tramo.
+  interrupt_state = __get_PRIMASK();
+  __disable_irq();
+
+  completed_buffers = gnss_rx_completed_buffers;
+  remaining = __HAL_DMA_GET_COUNTER(&hdma_usart1_rx);
+
+  if (__HAL_DMA_GET_FLAG(&hdma_usart1_rx,
+                        __HAL_DMA_GET_TC_FLAG_INDEX(&hdma_usart1_rx)) != RESET)
+  {
+      // Contar localmente la vuelta pendiente; el callback actualizará después el global.
+      // No borrar el indicador que HAL necesita atender.
+      completed_buffers++;
+      remaining = __HAL_DMA_GET_COUNTER(&hdma_usart1_rx);
+      // Si el contador está en la transición, esta vuelta ya se ha contabilizado.
+      if (remaining == 0)
+      {
+        remaining = GNSS_RX_BUFFER_SIZE;
+      }
+  }
+
+  // Restaurar el estado previo, sin habilitar interrupciones que ya estuvieran bloqueadas.
+  __set_PRIMASK(interrupt_state);
+
+  return completed_buffers * GNSS_RX_BUFFER_SIZE
+    + (GNSS_RX_BUFFER_SIZE - remaining);
+}
+
+// Retira un byte del búfer circular sin confundir una vuelta completa con un búfer vacío.
+// Devuelve 1 si entrega un byte, 0 si no hay pendientes y -1 si se alcanza la capacidad.
+// En caso de 0 o -1 no modifica la salida ni avanza el lector.
+static int32_t GNSS_ReadByte(uint8_t *received_byte)
+{
+    uint32_t pending;
+    uint8_t byte;
+
+    // Restar totales permite distinguir una vuelta completa de un búfer vacío.
+    pending = GNSS_GetReceivedCount() - gnss_rx_read_count;
+    // Rechazar también el búfer justo lleno, antes de que otro byte sobrescriba datos.
+    if (pending >= GNSS_RX_BUFFER_SIZE)
+    {
+      return -1;
+    }
+    else if (pending == 0)
+    {
+      return 0;
+    }
+
+    // Copiar sin avanzar aún el lector: el DMA sigue escribiendo.
+    byte = gnss_rx_buffer[gnss_rx_read_position];
+
+    pending = GNSS_GetReceivedCount() - gnss_rx_read_count;
+    if (pending >= GNSS_RX_BUFFER_SIZE)
+    {
+      return -1;
+    }
+
+    // Entregar el byte solo tras comprobar de nuevo la capacidad después de la copia.
+    *received_byte = byte;
+
+    gnss_rx_read_count++;
+    gnss_rx_read_position++;
+
+    // La posición vuelve al principio del array; el recuento de bytes continúa.
+    if (gnss_rx_read_position == GNSS_RX_BUFFER_SIZE)
+    {
+      gnss_rx_read_position = 0;
+    }
+
+    return 1;
+}
+
+// Atiende los avisos de USART1 en interrupción: cuenta vueltas y avisa al bucle.
+// El procesamiento de mensajes se realiza fuera de la interrupción.
+void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart,
+                              uint16_t Size)
+{
+    if (huart->Instance != USART1)
+    {
+        return;
+    }
+
+    // Solo TC cuenta una vuelta; HT e IDLE también pueden llamar a este callback.
+    if (HAL_UARTEx_GetRxEventType(huart) == HAL_UART_RXEVENT_TC)
+    {
+        gnss_rx_completed_buffers++;
+    }
+
+    gnss_rx_event = 1;
+    // La posición actual se obtiene del contador DMA, no del tamaño notificado.
+    (void)Size;
+}
+
+// Registra el error de USART1 y solicita que el bucle recupere la recepción.
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance != USART1)
+    {
+      return;
+    }
+    gnss_rx_last_error = HAL_UART_GetError(huart);
+    gnss_rx_error_pending = 1;
+}
+
+// Calcula CK_A y CK_B sobre length bytes, con sumas de ocho bits.
+// Para UBX se incluyen clase, identificador, longitud y datos, sin sincronismo ni checksum.
+static void GNSS_ComputeChecksum(const uint8_t *data,
+                                 uint16_t length,
+                                 uint8_t *checksum_a,
+                                 uint8_t *checksum_b)
+{
+    uint8_t a = 0;
+    uint8_t b = 0;
+
+    for (int i = 0; i < length; i++)
+    {
+      a = (uint8_t)(a + data[i]);
+      b = (uint8_t)(b + a);
+    }
+
+    *checksum_a = a;
+    *checksum_b = b;
+}
+
+// Construye y transmite una trama UBX con su checksum. No espera confirmación del receptor.
+// Devuelve 0 si se transmite y -1 por fallo, argumentos inválidos o exceso de tamaño.
+static int32_t GNSS_SendUbx(uint8_t message_class,
+                           uint8_t message_id,
+                           const uint8_t *payload,
+                           uint16_t payload_length)
+{
+    uint8_t packet[GNSS_TX_BUFFER_SIZE];
+    uint16_t packet_length;
+    HAL_StatusTypeDef status;
+
+    if (payload_length > GNSS_TX_BUFFER_SIZE - 8U)
+    {
+      return -1;
+    }
+    if (payload_length > 0 && payload == NULL)
+    {
+      return -1;
+    }
+    packet[0] = 0xB5;
+    packet[1] = 0x62;
+    packet[2] = message_class;
+    packet[3] = message_id;
+    packet[4] = (uint8_t)(payload_length & 0xFFU);
+    packet[5] = (uint8_t)(payload_length >> 8);
+    if (payload_length > 0)
+    {
+      memcpy(packet + 6, payload, payload_length);
+    }
+    // El checksum excluye los dos bytes de sincronismo.
+    GNSS_ComputeChecksum(packet + 2, payload_length + 4U, &packet[6U + payload_length], &packet[7U + payload_length]);
+    packet_length = payload_length + 8U;
+    status = HAL_UART_Transmit(&huart1, packet, packet_length, GNSS_TX_TIMEOUT_MS);
+    if (status != HAL_OK)
+    {
+      return -1;
+    }
+
+    return 0;
+}
+
+// Examina una trama ya validada y resuelve la confirmación pendiente si coincide.
+// Distingue aceptación (ACK-ACK) y rechazo (ACK-NAK); ignora otras respuestas.
+static void GNSS_HandleAck(const uint8_t *message, uint16_t length)
+{
+    if (length != 10)
+    {
+      return;
+    }
+    if (message[2] != 0x05)
+    {
+      return;
+    }
+    if (message[3] != 0x00 && message[3] != 0x01)
+    {
+      return;
+    }
+    if (gnss_ack_waiting != 1)
+    {
+      return;
+    }
+    if (message[6] != gnss_ack_expected_class || message[7] != gnss_ack_expected_id)
+    {
+      return;
+    }
+    if (message[3] == 0x01)
+    {
+      gnss_ack_result = 1;
+    }
+    else
+    {
+      gnss_ack_result = -1;
+    }
+    gnss_ack_waiting = 0;
+}
+
+// Comprueba sincronismo, longitud y checksum de una trama UBX completa.
+// Devuelve 1 si cumple esas comprobaciones y 0 si falla alguna.
+static int GNSS_CheckMessage(const uint8_t *message,
+                             uint16_t length)
+{
+    uint16_t payload_length;
+    uint8_t checksum_a = 0;
+    uint8_t checksum_b = 0;
+
+    if (length < 8)
+    {
+      return 0;
+    }
+    if (message[0] != 0xB5 || message[1] != 0x62)
+    {
+      return 0;
+    }
+    payload_length = (uint16_t)message[4] | ((uint16_t)message[5] << 8);
+    if ((uint32_t)payload_length + 8U != length)
+    {
+      return 0;
+    }
+    GNSS_ComputeChecksum(message + 2, length - 4U, &checksum_a, &checksum_b);
+    if (checksum_a != message[length - 2U] || checksum_b != message[length - 1U])
+    {
+      return 0;
+    }
+    return 1;
+}
+
+// Reconstruye un entero sin signo a partir de cuatro bytes, del menos al más significativo.
+static uint32_t GNSS_ReadU32LE(const uint8_t *data)
+{
+    uint32_t result = (uint32_t)data[0]
+                    | ((uint32_t)data[1] << 8)
+                    | ((uint32_t)data[2] << 16)
+                    | ((uint32_t)data[3] << 24);
+
+    return result;
+}
+
+// Reconstruye cuatro bytes como entero con signo de 32 bits.
+// Conserva el patrón de bits para interpretar también coordenadas y velocidades negativas.
+static int32_t GNSS_ReadI32LE(const uint8_t *data)
+{
+    uint32_t raw;
+    int32_t value;
+
+    raw = GNSS_ReadU32LE(data);
+    // Copiar los bits evita depender de una conversión numérica fuera del rango con signo.
+    memcpy(&value, &raw, sizeof(value));
+    return value;
+}
+
+// Escribe un entero de 32 bits en cuatro bytes, del menos al más significativo.
+static void GNSS_WriteU32LE(uint8_t *data, uint32_t value)
+{
+    data[0] = (uint8_t)value;
+    data[1] = (uint8_t)(value >> 8);
+    data[2] = (uint8_t)(value >> 16);
+    data[3] = (uint8_t)(value >> 24);
+}
+
+// Decodifica una trama UBX ya validada y publica los campos de NAV-PVT.
+// Devuelve 1 si la decodifica, 0 si es otro mensaje y -1 si la longitud es incorrecta.
+// Un retorno de 1 no garantiza una posición válida: hay que consultar fix_valid.
+static int32_t GNSS_DecodeNavPvt(const uint8_t *message,
+                                uint16_t length)
+{
+    GNSS_Data_t result = {0};
+
+    if (length < 8)
+    {
+      return -1;
+    }
+    if (message[2] != 0x01 || message[3] != 0x07)
+    {
+      return 0;
+    }
+    if (length != 100)
+    {
+      return -1;
+    }
+
+    const uint8_t *payload = message + 6;
+
+    // Campos de NAV-PVT según el protocolo M10; convertir a grados, metros y m/s.
+    result.time_of_week_ms = GNSS_ReadU32LE(payload);
+    result.fix_type = payload[20];
+    result.satellites = payload[23];
+    result.longitude_deg = (double)GNSS_ReadI32LE(payload + 24) * 1e-7;
+    result.latitude_deg = (double)GNSS_ReadI32LE(payload + 28) * 1e-7;
+    result.height_msl_m = (float)GNSS_ReadI32LE(payload + 36) / 1000.0f;
+    result.horizontal_accuracy_m = (float)GNSS_ReadU32LE(payload + 40) / 1000.0f;
+    result.vertical_accuracy_m = (float)GNSS_ReadU32LE(payload + 44) / 1000.0f;
+    result.velocity_north_mps = (float)GNSS_ReadI32LE(payload + 48) / 1000.0f;
+    result.velocity_east_mps = (float)GNSS_ReadI32LE(payload + 52) / 1000.0f;
+    // NAV-PVT expresa la componente vertical hacia abajo; aquí se toma positiva hacia arriba.
+    result.velocity_up_mps = -(float)GNSS_ReadI32LE(payload + 56) / 1000.0f;
+    result.speed_accuracy_mps = (float)GNSS_ReadU32LE(payload + 68) / 1000.0f;
+    // Marca de procesamiento en el STM32, distinta de la época GNSS de la solución.
+    result.reception_time_ms = HAL_GetTick();
+    // Comprobar solución 3D, indicadores de validez y rangos de coordenadas.
+    // Las estimaciones de error se conservan; aquí no se aplican umbrales de precisión.
+    if (result.fix_type == GNSS_FIX_TYPE_3D &&
+        (payload[21] & GNSS_FIX_OK_BIT) != 0U &&
+        (payload[78] & GNSS_INVALID_LLH_BIT) == 0U &&
+        result.longitude_deg >= -180.0 &&
+        result.longitude_deg <= 180.0 &&
+        result.latitude_deg >= -90.0 &&
+        result.latitude_deg <= 90.0)
+    {
+      result.fix_valid = 1;
+    }
+    gnss_data = result;
+    return 1;
+}
+
+// Reconstruye una trama UBX byte a byte y comprueba su longitud y checksum.
+// Devuelve 1 con una trama válida en gnss_message_buffer, 0 si continúa buscando
+// o reuniendo datos y -1 si rechaza una trama. Tras completarla o rechazarla, busca otra.
+static int32_t GNSS_ProcessByte(uint8_t byte)
+{
+    // Buscar los dos bytes de sincronismo antes de interpretar la cabecera.
+    if (gnss_message_count == 0)
+    {
+        if (byte == 0xB5)
+        {
+          gnss_message_buffer[0] = byte;
+          gnss_message_count = 1;
+        }
+        return 0;
+    }
+
+    if (gnss_message_count == 1)
+    {
+        if (byte == 0x62)
+        {
+          gnss_message_buffer[1] = byte;
+          gnss_message_count = 2;
+        }
+        // Otro 0xB5 puede ser el comienzo de una nueva cabecera.
+        else if (byte != 0xB5)
+        {
+          gnss_message_count = 0;
+        }
+        return 0;
+    }
+
+    if (gnss_message_count >= GNSS_MESSAGE_BUFFER_SIZE)
+    {
+      gnss_message_count = 0;
+      gnss_expected_length = 0;
+      return -1;
+    }
+    gnss_message_buffer[gnss_message_count] = byte;
+    gnss_message_count ++;
+    // La cabecera ya permite rechazar longitudes que no caben en el búfer.
+    if (gnss_message_count == 6)
+    {
+      uint16_t payload_length = (uint16_t)gnss_message_buffer[4] | ((uint16_t)gnss_message_buffer[5] << 8);
+      if (payload_length > (GNSS_MESSAGE_BUFFER_SIZE - 8U))
+      {
+        gnss_message_count = 0;
+        gnss_expected_length = 0;
+        return -1;
+      }
+      gnss_expected_length = payload_length + 8U;
+    }
+    // Validar la trama completa antes de entregarla a los manejadores.
+    if (gnss_expected_length != 0U && gnss_message_count == gnss_expected_length)
+    {
+      int message_valid = GNSS_CheckMessage(gnss_message_buffer, gnss_message_count);
+
+      if (message_valid == 1)
+      {
+        gnss_message_length = gnss_message_count;
+      }
+
+      gnss_message_count = 0;
+      gnss_expected_length = 0;
+
+      if ( message_valid == 0)
+      {
+        return -1;
+      }
+
+      return 1;
+    }
+    return 0;
+}
+
+// Procesa un número limitado de bytes por llamada para compartir tiempo con otros sensores.
+// Entrega las tramas a los manejadores de confirmación y navegación.
+// Si se llena el búfer, invalida la solución y solicita reiniciar la recepción.
+static void GNSS_ProcessReceived(void)
+{
+    uint8_t byte;
+    int32_t status;
+
+    if  (gnss_rx_event == 0 || gnss_rx_error_pending != 0)
+    {
+      return;
+    }
+    // Borrar el aviso antes de procesar para conservar los nuevos avisos de interrupción.
+    gnss_rx_event = 0;
+    for (uint16_t i = 0; i < GNSS_MAX_BYTES_PER_UPDATE; i++)
+    {
+        status = GNSS_ReadByte(&byte);
+        // Una pérdida del búfer requiere reiniciar la recepción, no continuar con el mensaje parcial.
+        if (status == -1)
+        {
+            gnss_rx_overflow_count++;
+            gnss_rx_error_pending = 1;
+            gnss_data.fix_valid = 0;
+            return;
+        }
+        else if (status == 0)
+        {
+          break;
+        }
+        status = GNSS_ProcessByte(byte);
+        if (status == 1)
+        {
+          GNSS_HandleAck(gnss_message_buffer, gnss_message_length);
+          status = GNSS_DecodeNavPvt(gnss_message_buffer, gnss_message_length);
+        }
+        if (status == -1)
+        {
+          gnss_message_errors++;
+        }
+    }
+
+    // Solicitar otra pasada si se agotó el cupo o llegaron más bytes.
+    if (GNSS_GetReceivedCount() != gnss_rx_read_count)
+    {
+        gnss_rx_event = 1;
+    }
+}
+
+// Envía una orden UBX y procesa la recepción mientras espera su confirmación.
+// Devuelve 0 si el receptor la acepta; -1 por rechazo, error o tiempo agotado.
+// Se usa durante la configuración, antes de entrar en el bucle de adquisición.
+static int32_t GNSS_SendAndWaitAck(uint8_t message_class,
+                                 uint8_t message_id,
+                                 const uint8_t *payload,
+                                 uint16_t payload_length)
+{
+    uint32_t start_ms;
+    int32_t status;
+
+    if (gnss_rx_ready == 0 || gnss_rx_error_pending == 1)
+    {
+      return -1;
+    }
+    gnss_ack_expected_class = message_class;
+    gnss_ack_expected_id = message_id;
+    gnss_ack_result = 0;
+    gnss_ack_waiting = 1;
+    status = GNSS_SendUbx(message_class, message_id, payload, payload_length);
+    if (status != 0)
+    {
+      gnss_ack_waiting = 0;
+      return -1;
+    }
+    start_ms = HAL_GetTick();
+    while (gnss_ack_waiting == 1 && HAL_GetTick() - start_ms < GNSS_ACK_TIMEOUT_MS)
+    {
+      if (gnss_rx_error_pending == 1)
+      {
+        break;
+      }
+      GNSS_ProcessReceived();
+      if (gnss_ack_waiting == 1)
+      {
+        HAL_Delay(1);
+      }
+    }
+    // Cerrar la espera también si terminó por error o por tiempo agotado.
+    gnss_ack_waiting = 0;
+    if (gnss_rx_error_pending == 1 || gnss_ack_result != 1)
+    {
+      return -1;
+    }
+    return 0;
+}
+
+// Aplica una clave CFG-VALSET de un byte en la RAM del receptor.
+// Devuelve 0 si recibe aceptación y -1 si falla; no guarda el ajuste de forma permanente.
+static int32_t GNSS_SetConfigU8(uint32_t key, uint8_t value)
+{
+    uint8_t payload[9] = {0};
+
+    // Seleccionar solo la capa RAM; la cabecera empieza con versión y campos reservados a cero.
+    payload[1] = 1;
+    GNSS_WriteU32LE(payload + 4, key);
+    payload[8] = value;
+    return GNSS_SendAndWaitAck(0x06, 0x8A, payload, sizeof(payload));
+}
+
+// Aplica una clave CFG-VALSET de dos bytes en la RAM del receptor.
+// Devuelve 0 si recibe aceptación y -1 si falla; no guarda el ajuste de forma permanente.
+static int32_t GNSS_SetConfigU16(uint32_t key, uint16_t value)
+{
+    uint8_t payload[10] = {0};
+
+    // Seleccionar solo la capa RAM; los dos bytes del valor se envían del menor al mayor.
+    payload[1] = 1;
+    GNSS_WriteU32LE(payload + 4, key);
+    payload[8] = (uint8_t)value;
+    payload[9] = (uint8_t)(value >> 8);
+    return GNSS_SendAndWaitAck(0x06, 0x8A, payload, sizeof(payload));
+}
+
+// Cambia la velocidad de USART1 del STM32 y reinicia su recepción DMA.
+// No modifica el receptor GNSS. Devuelve 0 si funciona y -1 si falla.
+static int32_t GNSS_SetLocalBaudrate(uint32_t baudrate)
+{
+    int32_t status;
+
+    gnss_rx_ready = 0;
+    gnss_ack_waiting = 0;
+    gnss_data.fix_valid = 0;
+    status = HAL_UART_AbortReceive(&huart1);
+    if (status != HAL_OK)
+    {
+      return -1;
+    }
+    huart1.Init.BaudRate = baudrate;
+    status = HAL_UART_Init(&huart1);
+    if (status != HAL_OK)
+    {
+      return -1;
+    }
+    status = GNSS_RestartReception();
+    gnss_rx_ready = (status == 0);
+    return status;
+}
+
+// Cambia la velocidad del receptor y del STM32 y verifica la comunicación resultante.
+// Devuelve 0 si la nueva comunicación responde y -1 si falla algún paso.
+static int32_t GNSS_ChangeBaudrate(uint32_t baudrate)
+{
+    uint8_t payload[12] = {0};
+    int32_t status;
+
+    payload[1] = 1;
+    GNSS_WriteU32LE(payload + 4, GNSS_CFG_UART1_BAUDRATE );
+    GNSS_WriteU32LE(payload + 8, baudrate);
+    // No esperar el ACK del cambio de velocidad: la comunicación atraviesa una transición.
+    gnss_rx_ready = 0;
+    gnss_ack_waiting = 0;
+    gnss_data.fix_valid = 0;
+    status = HAL_UART_AbortReceive(&huart1);
+    if (status != HAL_OK)
+    {
+      return -1;
+    }
+    status = GNSS_SendUbx(0x06, 0x8A, payload, sizeof(payload));
+    if (status != 0)
+    {
+      return -1;
+    }
+    // Dar tiempo al receptor antes de adaptar la UART local.
+    HAL_Delay(GNSS_BAUD_SETTLE_MS);
+    status = GNSS_SetLocalBaudrate(baudrate);
+    if (status != 0)
+    {
+      return -1;
+    }
+    // Una orden confirmada a la nueva velocidad comprueba ambos sentidos de comunicación.
+    status = GNSS_SetConfigU8(GNSS_CFG_NAVSPG_DYNMODEL, GNSS_DYNMODEL_AIRBORNE_4G);
+    return status;
+}
+
+// Busca el receptor a 9600 o 115200 bit/s y aplica GPS + Galileo a 10 Hz,
+// Airborne <4g y salida NAV-PVT por UART a 115200 bit/s.
+// Devuelve 0 si completa la configuración y -1 si falla; incluye esperas de arranque.
+static int32_t GNSS_Configure(void)
+{
+
+    // Probar el valor de fábrica y el que puede conservar el receptor si solo se reinicia el STM32.
+    const uint32_t baudrates[] = {9600U, GNSS_UART_BAUDRATE};
+    int32_t status = -1;
+
+    for (uint32_t baud_index = 0;
+        baud_index < sizeof(baudrates) / sizeof(baudrates[0]);
+        baud_index++)
+    {
+        // Reintentar para dar margen al arranque del receptor.
+        for (uint32_t attempt = 0; attempt < GNSS_STARTUP_ATTEMPTS; attempt++)
+        {
+            gnss_rx_ready = (GNSS_SetLocalBaudrate(baudrates[baud_index]) == 0);
+            if (gnss_rx_ready == 0)
+            {
+              return -1;
+            }
+            status = GNSS_SetConfigU8(GNSS_CFG_NAVSPG_DYNMODEL, GNSS_DYNMODEL_AIRBORNE_4G);
+            if (status == 0)
+            {
+              break;
+            }
+            if (attempt + 1U < GNSS_STARTUP_ATTEMPTS)
+            {
+              HAL_Delay(GNSS_STARTUP_RETRY_MS);
+            }
+        }
+        if (status == 0)
+        {
+          break;
+        }
+    }
+
+    if (status != 0)
+    {
+      return -1;
+    }
+
+    // Habilitar UBX y desactivar NMEA; detener NAV-PVT mientras se aplican los ajustes.
+    status = GNSS_SetConfigU8(GNSS_CFG_UART1OUTPROT_UBX, 1U);
+    if (status != 0)
+    {
+      return -1;
+    }
+
+    status = GNSS_SetConfigU8(GNSS_CFG_UART1OUTPROT_NMEA, 0U);
+    if (status != 0)
+    {
+      return -1;
+    }
+
+    status = GNSS_SetConfigU8(GNSS_CFG_MSGOUT_NAV_PVT_UART1, 0U);
+    if (status != 0)
+    {
+      return -1;
+    }
+
+    // Seleccionar GPS + Galileo. Tras cada ajuste de señales, esperar 500 ms,
+    // además del ACK, para que se reinicie el subsistema GNSS.
+    status = GNSS_SetConfigU8(GNSS_CFG_SIGNAL_SBAS_ENA, 0U);
+    if (status != 0)
+    {
+      return -1;
+    }
+    HAL_Delay(GNSS_SIGNAL_SETTLE_MS);
+
+    status = GNSS_SetConfigU8(GNSS_CFG_SIGNAL_BDS_ENA, 0U);
+    if (status != 0)
+    {
+      return -1;
+    }
+    HAL_Delay(GNSS_SIGNAL_SETTLE_MS);
+
+    status = GNSS_SetConfigU8(GNSS_CFG_SIGNAL_QZSS_ENA, 0U);
+    if (status != 0)
+    {
+      return -1;
+    }
+    HAL_Delay(GNSS_SIGNAL_SETTLE_MS);
+
+    status = GNSS_SetConfigU8(GNSS_CFG_SIGNAL_GLO_ENA, 0U);
+    if (status != 0)
+    {
+      return -1;
+    }
+    HAL_Delay(GNSS_SIGNAL_SETTLE_MS);
+
+    status = GNSS_SetConfigU8(GNSS_CFG_SIGNAL_GPS_L1CA_ENA, 1U);
+    if (status != 0)
+    {
+      return -1;
+    }
+    HAL_Delay(GNSS_SIGNAL_SETTLE_MS);
+
+    status = GNSS_SetConfigU8(GNSS_CFG_SIGNAL_GPS_ENA, 1U);
+    if (status != 0)
+    {
+      return -1;
+    }
+    HAL_Delay(GNSS_SIGNAL_SETTLE_MS);
+
+    status = GNSS_SetConfigU8(GNSS_CFG_SIGNAL_GAL_E1_ENA, 1U);
+    if (status != 0)
+    {
+      return -1;
+    }
+    HAL_Delay(GNSS_SIGNAL_SETTLE_MS);
+
+    status = GNSS_SetConfigU8(GNSS_CFG_SIGNAL_GAL_ENA, 1U);
+    if (status != 0)
+    {
+      return -1;
+    }
+    HAL_Delay(GNSS_SIGNAL_SETTLE_MS);
+
+    // Aplicar la velocidad final aunque la búsqueda inicial funcionara a 9600 bit/s.
+    status = GNSS_ChangeBaudrate(GNSS_UART_BAUDRATE);
+    if (status != 0)
+    {
+      return -1;
+    }
+
+    // Una solución cada 100 ms y un NAV-PVT por solución: salida nominal de 10 Hz.
+    status = GNSS_SetConfigU16(GNSS_CFG_RATE_NAV, 1U);
+    if (status != 0)
+    {
+      return -1;
+    }
+
+    status = GNSS_SetConfigU16(GNSS_CFG_RATE_MEAS, 100U);
+    if (status != 0)
+    {
+      return -1;
+    }
+
+    status = GNSS_SetConfigU8(GNSS_CFG_MSGOUT_NAV_PVT_UART1, 1U);
+    if (status != 0)
+    {
+      return -1;
+    }
+
+    return 0;
+}
+
+// Procesa navegación, invalida datos antiguos y reintenta la recepción tras un error.
+// Solo utiliza el receptor si su configuración inicial terminó correctamente.
+static void GNSS_Update(void)
+{
+    uint32_t now = HAL_GetTick();
+
+    // No aceptar datos de un receptor cuya configuración quedó incompleta.
+    if (gnss_configured == 0)
+    {
+        gnss_data.fix_valid = 0;
+        return;
+    }
+
+    // Espaciar los intentos de recuperación para no ocupar continuamente el bucle.
+    if (gnss_rx_error_pending == 1 || gnss_rx_ready == 0)
+    {
+      gnss_data.fix_valid = 0;
+      if (now - gnss_last_restart_ms >= GNSS_RETRY_PERIOD_MS)
+      {
+        gnss_last_restart_ms = now;
+        gnss_rx_ready = (GNSS_RestartReception() == 0);
+      }
+      return;
+    }
+    GNSS_ProcessReceived();
+    // Un error o llenado del búfer durante el procesamiento invalida la solución.
+    if (gnss_rx_error_pending == 1)
+    {
+      gnss_rx_ready = 0;
+      gnss_data.fix_valid = 0;
+      return;
+    }
+    // Conservar los campos para diagnóstico, pero retirar su validez si dejan de actualizarse.
+    if (HAL_GetTick() - gnss_data.reception_time_ms >= GNSS_DATA_TIMEOUT_MS)
+    {
+      gnss_data.fix_valid = 0;
+    }
+}
+
 /* USER CODE END 0 */
 
 /**
@@ -812,9 +1760,23 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_I2C1_Init();
   MX_SPI1_Init();
+  MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
+
+  // Completar la configuración del GNSS antes de iniciar las medidas inerciales.
+  gnss_last_restart_ms = HAL_GetTick();
+  gnss_rx_ready = (GNSS_RestartReception() == 0);
+
+  // Configurar el receptor únicamente si se ha iniciado la recepción.
+  if (gnss_rx_ready == 1)
+  {
+      gnss_configured = (GNSS_Configure() == 0);
+  }
+
+  // Inicializar la IMU y habilitar su lectura solo si termina correctamente.
   imu_ctx.read_reg = IMU_Read;
   imu_ctx.write_reg = IMU_Write;
   imu_ctx.mdelay = HAL_Delay;
@@ -822,6 +1784,7 @@ int main(void)
 
   imu_ready = (IMU_Init() == 0);
 
+  // Inicializar el acelerómetro de alto rango con el mismo criterio.
   highg_ctx.read_reg = HIGHG_Read;
   highg_ctx.write_reg = HIGHG_Write;
   highg_ctx.mdelay = HAL_Delay;
@@ -829,7 +1792,9 @@ int main(void)
 
   highg_ready = (HIGHG_Init() == 0);
 
+  // Iniciar los periodos de adquisición al terminar la configuración.
   baro_last_request_ms = HAL_GetTick();
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -844,14 +1809,14 @@ int main(void)
     {
       // Se lleva a cabo la lectura de aceleración.
       imu_acceleration_status = IMU_ReadAcceleration(imu_acceleration_g);
-      // En caso de obtener una muestra nueva se actualiza la marca de tiempo.
+      // Marcar el instante de lectura solo si se ha obtenido una muestra nueva.
       if (imu_acceleration_status == 1)
       {
         imu_acceleration_time_ms = HAL_GetTick();
       }
       // Se lleva a cabo la lectura de velocidad angular.
       imu_angular_rate_status = IMU_ReadAngularRate(imu_angular_rate_dps);
-      // En caso de obtener una muestra nueva se actualiza la marca de tiempo.
+      // Marcar el instante de lectura solo si se ha obtenido una muestra nueva.
       if (imu_angular_rate_status == 1)
       {
         imu_angular_rate_time_ms = HAL_GetTick();
@@ -863,7 +1828,7 @@ int main(void)
     {
       // Se lleva a cabo la lectura de aceleración.
       highg_acceleration_status = HIGHG_ReadAcceleration(highg_acceleration_g);
-      // En caso de obtener una muestra nueva se actualiza la marca de tiempo.
+      // Marcar el instante de lectura solo si se ha obtenido una muestra nueva.
       if (highg_acceleration_status == 1)
       {
         highg_acceleration_time_ms = HAL_GetTick();
@@ -873,8 +1838,9 @@ int main(void)
     // Se gestiona la adquisición de medidas del barómetro.
     BARO_Update();
 
-    // Se espera 1 ms antes de la siguiente lectura
-    HAL_Delay(1);
+    // Se procesan los datos del GNSS y se supervisa la recepción.
+    GNSS_Update();
+
   }
   /* USER CODE END 3 */
 }
@@ -994,6 +1960,55 @@ static void MX_SPI1_Init(void)
   /* USER CODE BEGIN SPI1_Init 2 */
 
   /* USER CODE END SPI1_Init 2 */
+
+}
+
+/**
+  * @brief USART1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART1_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART1_Init 0 */
+
+  /* USER CODE END USART1_Init 0 */
+
+  /* USER CODE BEGIN USART1_Init 1 */
+
+  /* USER CODE END USART1_Init 1 */
+  huart1.Instance = USART1;
+  huart1.Init.BaudRate = 9600;
+  huart1.Init.WordLength = UART_WORDLENGTH_8B;
+  huart1.Init.StopBits = UART_STOPBITS_1;
+  huart1.Init.Parity = UART_PARITY_NONE;
+  huart1.Init.Mode = UART_MODE_TX_RX;
+  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART1_Init 2 */
+
+  /* USER CODE END USART1_Init 2 */
+
+}
+
+/**
+  * Enable DMA controller clock
+  */
+static void MX_DMA_Init(void)
+{
+
+  /* DMA controller clock enable */
+  __HAL_RCC_DMA2_CLK_ENABLE();
+
+  /* DMA interrupt init */
+  /* DMA2_Stream2_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA2_Stream2_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA2_Stream2_IRQn);
 
 }
 
