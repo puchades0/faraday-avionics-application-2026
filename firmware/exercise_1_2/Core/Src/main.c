@@ -69,30 +69,38 @@ typedef struct
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+// IMU: bit de lectura SPI y tiempos de arranque y reinicio, en milisegundos.
 #define IMU_SPI_READ_BIT (1U << 7)
 #define IMU_RESET_TIMEOUT_MS 100U
 #define IMU_BOOT_TIME_MS 10U
 
+// Acelerómetro de alto rango: bits SPI de lectura y acceso múltiple, y espera de arranque.
 #define HIGHG_SPI_READ_BIT  (1U << 7)
 #define HIGHG_SPI_MULTI_BIT (1U << 6)
 #define HIGHG_BOOT_TIME_MS 5U
 
+// Barómetro: dirección de fábrica, orden de medición simple y plazo de transferencia.
+// HAL recibe la dirección I2C de siete bits desplazada una posición a la izquierda.
 #define BARO_I2C_ADDRESS_7BIT 0x28U
 #define BARO_I2C_ADDRESS_HAL (BARO_I2C_ADDRESS_7BIT << 1)
 #define BARO_CMD_SINGLE_MEASUREMENT 0xAAU
 #define BARO_I2C_TIMEOUT_MS 5U
 
+// Bits del estado del AMS 5935: ocupado, fallo de memoria y desbordamiento de señal.
 #define BARO_STATUS_BUSY_BIT          (1U << 5)
 #define BARO_STATUS_MEMORY_ERROR_BIT  (1U << 2)
 #define BARO_STATUS_OVERFLOW_BIT      (1U << 0)
 
+// Comprobar también los bits cuyo valor está fijado por el fabricante.
 #define BARO_STATUS_FIXED_MASK \
     ((1U << 7) | (1U << 6) | (1U << 4) | (1U << 3))
 #define BARO_STATUS_FIXED_VALUE       (1U << 6)
 
+// Conversión de la salida de 24 bits para la variante de presión absoluta 0..1500 hPa.
 #define BARO_DIGITAL_SCALE     16777216.0f
 #define BARO_PRESSURE_MAX_HPA   1500.0f
 
+// Periodo nominal de 50 Hz, espera inicial de conversión y plazo máximo de estado ocupado.
 #define BARO_PERIOD_MS 20U
 #define BARO_CONVERSION_WAIT_MS 4U
 #define BARO_MEASUREMENT_TIMEOUT_MS 10U
@@ -187,20 +195,26 @@ UART_HandleTypeDef huart1;
 DMA_HandleTypeDef hdma_usart1_rx;
 
 /* USER CODE BEGIN PV */
+// IMU: adaptación del controlador de ST a SPI e indicadores de identificación e inicialización.
 static stmdev_ctx_t imu_ctx = {0};
 
 static int imu_identified = 0;
 static int imu_ready = 0;
 
+// Últimas medidas de los ejes X, Y y Z. Los sufijos indican las unidades.
 static float imu_acceleration_g[3] = {0};
 static float imu_angular_rate_dps[3] = {0};
 
+// Resultado de la última consulta: 1 = muestra nueva, 0 = sin novedad, -1 = error.
 static int32_t imu_acceleration_status = 0;
 static int32_t imu_angular_rate_status = 0;
 
+// Instantes de lectura de las últimas muestras obtenidas correctamente, según HAL_GetTick().
 static uint32_t imu_acceleration_time_ms = 0;
 static uint32_t imu_angular_rate_time_ms = 0;
 
+// Acelerómetro de alto rango: controlador, indicadores y última muestra XYZ.
+// Estado y marca de tiempo siguen el mismo criterio que los de la IMU.
 static stmdev_ctx_t highg_ctx = {0};
 
 static int highg_identified = 0;
@@ -211,11 +225,14 @@ static float highg_acceleration_g[3] = {0};
 static int32_t highg_acceleration_status = 0;
 static uint32_t highg_acceleration_time_ms = 0;
 
+// Barómetro: última presión y temperatura del sensor.
+// Estado: 1 = lectura correcta, 0 = sin medida terminada, -1 = error.
 static float baro_pressure_hpa = 0.0f;
 static float baro_temperature_c = 0.0f;
 static int32_t baro_measurement_status = 0;
 static uint32_t baro_measurement_time_ms = 0;
 
+// Seguimiento de la conversión solicitada y de sus tiempos, en milisegundos.
 static int baro_measurement_pending = 0;
 static uint32_t baro_last_request_ms = 0;
 static uint32_t baro_measurement_start_ms = 0;
@@ -296,17 +313,15 @@ static void MX_ADC1_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-// Devuelve 1 si se identifica la IMU esperada; 0 si falla la lectura o no coincide.
+
+// Comprueba WHO_AM_I del ISM330DHCX. Devuelve 1 si coincide; 0 si falla o es otro dispositivo.
 static int IMU_CheckIdentity(void)
 {
     uint8_t id = 0;
     int32_t status;
 
-    // Leer WHO_AM_I mediante la biblioteca de ST, que utiliza nuestra IMU_Read.
     status = ism330dhcx_device_id_get(&imu_ctx, &id);
 
-    // La biblioteca devuelve 0 cuando la lectura termina correctamente.
-    // Además, el identificador recibido debe coincidir con el del ISM330DHCX.
     if (status == 0 && id == ISM330DHCX_ID)
     {
       return 1;
@@ -314,6 +329,8 @@ static int IMU_CheckIdentity(void)
     return 0;
 }
 
+// Adapta la lectura de registros del controlador de ST a SPI.
+// Escribe len bytes en bufp; devuelve 0 si funciona y -1 si falla la comunicación.
 static int32_t IMU_Read(void *handle, uint8_t reg,
                         uint8_t *bufp, uint16_t len)
 {
@@ -321,22 +338,18 @@ static int32_t IMU_Read(void *handle, uint8_t reg,
     uint8_t command = reg | IMU_SPI_READ_BIT;
     HAL_StatusTypeDef status;
 
+    // La HAL genera el reloj de recepción enviando estos bytes de relleno.
     memset(bufp, 0, len);
 
-    // 1. Seleccionar la IMU.
     HAL_GPIO_WritePin(IMU_CS_GPIO_Port, IMU_CS_Pin, GPIO_PIN_RESET);
-    // 2. Enviar command y guardar el resultado en status.
     status = HAL_SPI_Transmit(spi, &command, 1, 5);
-    // 3. Solo si el envío ha ido bien, recibir len bytes
-    //    en bufp y actualizar status.
     if (status == HAL_OK)
     {
       status = HAL_SPI_Receive(spi, bufp, len, 5);
     }
 
-    // 4. Deseleccionar la IMU, aunque haya fallado algo.
+    // Liberar CS también si falla la transferencia.
     HAL_GPIO_WritePin(IMU_CS_GPIO_Port, IMU_CS_Pin, GPIO_PIN_SET);
-    // 5. Devolver 0 si todo ha ido bien; -1 si ha fallado.
     if (status == HAL_OK)
     {
       return 0;
@@ -344,6 +357,8 @@ static int32_t IMU_Read(void *handle, uint8_t reg,
     return -1;
 }
 
+// Escribe len bytes desde bufp en los registros de la IMU mediante SPI.
+// Devuelve 0 si funciona y -1 si falla la comunicación.
 static int32_t IMU_Write(void *handle, uint8_t reg,
                          const uint8_t *bufp, uint16_t len)
 {
@@ -351,20 +366,15 @@ static int32_t IMU_Write(void *handle, uint8_t reg,
     uint8_t command = reg & ~IMU_SPI_READ_BIT;
     HAL_StatusTypeDef status;
 
-    // 1. Seleccionar la IMU.
     HAL_GPIO_WritePin(IMU_CS_GPIO_Port, IMU_CS_Pin, GPIO_PIN_RESET);
-    // 2. Enviar command y guardar el resultado en status.
     status = HAL_SPI_Transmit(spi, &command, 1, 5);
-    // 3. Solo si el envío ha ido bien, transmitir len bytes
-    //    en bufp y actualizar status.
     if (status == HAL_OK)
     {
       status = HAL_SPI_Transmit(spi, bufp, len, 5);
     }
 
-    // 4. Deseleccionar la IMU, aunque haya fallado algo.
+    // Liberar CS también si falla la transferencia.
     HAL_GPIO_WritePin(IMU_CS_GPIO_Port, IMU_CS_Pin, GPIO_PIN_SET);
-    // 5. Devolver 0 si todo ha ido bien; -1 si ha fallado.
     if (status == HAL_OK)
     {
       return 0;
@@ -372,22 +382,20 @@ static int32_t IMU_Write(void *handle, uint8_t reg,
     return -1;
 }
 
+// Solicita el reinicio de la IMU y espera su finalización con un plazo limitado.
+// Devuelve 0 si termina; -1 si falla la comunicación o se agota el tiempo.
 static int32_t IMU_Reset(void)
 {
     uint8_t reset_pending = 1;
     uint32_t start;
     int32_t status;
 
-    // 1. Solicitar el reinicio. Si falla la comunicación, devolver -1.
     status = ism330dhcx_reset_set(&imu_ctx, PROPERTY_ENABLE);
     if (status != 0)
     {
       return -1;
     }
-    // 2. Guardar el instante en que empieza la espera.
     start = HAL_GetTick();
-    // 3. Consultar el estado del reinicio hasta que termine,
-    //    falle la comunicación o se agote el tiempo.
     while (reset_pending != 0)
     {
       status = ism330dhcx_reset_get(&imu_ctx, &reset_pending);
@@ -399,192 +407,177 @@ static int32_t IMU_Reset(void)
       {
         return 0;
       }
+      // La resta sin signo admite el retorno a cero del contador durante esta espera breve.
       if (HAL_GetTick() - start >= IMU_RESET_TIMEOUT_MS)
       {
         return -1;
       }
       HAL_Delay(1);
     }
-    // 4. Devolver 0 si el reinicio ha terminado correctamente.
     return 0;
 }
 
+// Configura la IMU a ±16 g y ±4000 °/s, con ambas salidas a 208 Hz.
+// Devuelve 0 si se completan los ajustes y -1 si falla alguno.
 static int32_t IMU_Configure(void)
 {
     int32_t status;
 
-    // Desactivar la interfaz I2C de la IMU, porque utilizamos SPI.
+    // Desactivar I2C porque esta IMU se comunica por SPI.
     status = ism330dhcx_i2c_interface_set(&imu_ctx, ISM330DHCX_I2C_DISABLE);
     if (status != 0)
     {
         return -1;
     }
-    // Activar la configuración del dispositivo indicada por ST.
+    // Aplicar la configuración de dispositivo indicada por ST.
     status = ism330dhcx_device_conf_set(&imu_ctx, PROPERTY_ENABLE);
     if (status != 0)
     {
         return -1;
     }
-    // Evitar mezclar los dos bytes de una medida durante su lectura.
+    // BDU evita mezclar los dos bytes de muestras distintas.
     status = ism330dhcx_block_data_update_set(&imu_ctx, PROPERTY_ENABLE);
     if (status != 0)
     {
         return -1;
     }
-    // Recibir los bytes de las medidas sin enviar una dirección nueva para cada uno.
+    // Incrementar la dirección del registro durante las lecturas de varios bytes.
     status = ism330dhcx_auto_increment_set(&imu_ctx, PROPERTY_ENABLE);
     if (status != 0)
     {
         return -1;
     }
-    // Configurar el rango del acelerómetro a ±16g.
     status = ism330dhcx_xl_full_scale_set(&imu_ctx, ISM330DHCX_16g);
     if (status != 0)
     {
         return -1;
     }
-    // Configurar el rango del giróscopo a ±4000 °/s.
     status = ism330dhcx_gy_full_scale_set(&imu_ctx, ISM330DHCX_4000dps);
     if (status != 0)
     {
         return -1;
     }
-    // Configurar frecuencia del acelerómetro a 208 Hz.
     status = ism330dhcx_xl_data_rate_set(&imu_ctx, ISM330DHCX_XL_ODR_208Hz);
     if (status != 0)
     {
         return -1;
     }
-    // Configurar frecuencia del giróscopo a 208 Hz.
     status = ism330dhcx_gy_data_rate_set(&imu_ctx, ISM330DHCX_GY_ODR_208Hz);
     if (status != 0)
     {
         return -1;
     }
-    // Todas las configuraciones han resultado exitosas, devuelve 0.
     return 0;
 }
 
+// Espera el arranque, identifica, reinicia y configura la IMU.
+// Devuelve 0 si queda inicializada y -1 si falla algún paso.
 static int32_t IMU_Init(void)
 {
-  // Esperar al arranque del sensor antes de iniciar la comunicación.
   HAL_Delay(IMU_BOOT_TIME_MS);
-  // Se comprueba la identificación del sensor.
   imu_identified = IMU_CheckIdentity();
   if (imu_identified == 0)
   {
     return -1;
   }
-  // Se lleva a cabo el Reset del sensor.
   if (IMU_Reset() != 0)
   {
     return -1;
   }
-  // Se lleva a cabo la configuración del sensor.
   if (IMU_Configure() != 0)
   {
     return -1;
   }
-  // Si todos los pasos han sido correctos devuelve 0.
   return 0;
 }
 
+// Lee los tres ejes de aceleración y los convierte a g.
+// Devuelve 1 con una muestra nueva, 0 si no hay datos nuevos y -1 si falla.
+// Solo actualiza el array de salida cuando la lectura termina correctamente.
 static int32_t IMU_ReadAcceleration(float acceleration_g[3])
 {
     uint8_t data_ready = 0;
     int16_t raw[3] = {0};
     int32_t status;
 
-    // 1. Consultar si hay una medida nueva.
-    //    Si falla la consulta, devolver -1.
     status = ism330dhcx_xl_flag_data_ready_get(&imu_ctx, &data_ready);
     if (status != 0)
     {
         return -1;
     }
-    // 2. Si no hay una medida nueva, devolver 0.
     if (data_ready == 0)
     {
       return 0;
     }
-    // 3. Leer los tres ejes en raw.
-    //    Si falla la lectura, devolver -1.
     status = ism330dhcx_acceleration_raw_get(&imu_ctx, raw);
     if (status != 0)
     {
         return -1;
     }
-    // 4. Convertir cada eje a g y guardarlo en acceleration_g.
     for (int i = 0; i < 3; i++)
     {
       acceleration_g[i] = ism330dhcx_from_fs16g_to_mg(raw[i]) / 1000.0f;
     }
-    // 5. Devolver 1 para indicar que se ha obtenido una medida nueva.
     return 1;
 }
 
+// Lee los tres ejes de velocidad angular y los convierte a grados por segundo.
+// Devuelve 1 con una muestra nueva, 0 si no hay datos nuevos y -1 si falla.
+// Solo actualiza el array de salida cuando la lectura termina correctamente.
 static int32_t IMU_ReadAngularRate(float angular_rate_dps[3])
 {
     uint8_t data_ready = 0;
     int16_t raw[3] = {0};
     int32_t status;
 
-    // 1. Consultar si hay una medida nueva.
-    //    Si falla la consulta, devolver -1.
     status = ism330dhcx_gy_flag_data_ready_get(&imu_ctx, &data_ready);
     if (status != 0)
     {
         return -1;
     }
-    // 2. Si no hay una medida nueva, devolver 0.
     if (data_ready == 0)
     {
       return 0;
     }
-    // 3. Leer los tres ejes en raw.
-    //    Si falla la lectura, devolver -1.
     status = ism330dhcx_angular_rate_raw_get(&imu_ctx, raw);
     if (status != 0)
     {
         return -1;
     }
-    // 4. Convertir cada eje a dps y guardarlo en angular_rate_dps.
     for (int i = 0; i < 3; i++)
     {
       angular_rate_dps[i] = ism330dhcx_from_fs4000dps_to_mdps(raw[i]) / 1000.0f;
     }
-    // 5. Devolver 1 para indicar que se ha obtenido una medida nueva.
     return 1;
 }
 
+// Adapta la lectura de registros del H3LIS331DL a SPI, incluido el acceso a varios bytes.
+// Escribe len bytes en bufp; devuelve 0 si funciona y -1 si falla.
 static int32_t HIGHG_Read(void *handle, uint8_t reg,
                           uint8_t *bufp, uint16_t len)
 {
     SPI_HandleTypeDef *spi = (SPI_HandleTypeDef *)handle;
     uint8_t command = reg & ~(HIGHG_SPI_READ_BIT | HIGHG_SPI_MULTI_BIT);
     command = command | HIGHG_SPI_READ_BIT;
+    // El bit de acceso múltiple permite recorrer varios registros con un solo comando.
     if (len > 1)
     {
       command = command | HIGHG_SPI_MULTI_BIT;
     }
     HAL_StatusTypeDef status;
 
+    // Preparar los bytes de relleno que la HAL envía mientras recibe por SPI.
     memset(bufp, 0, len);
 
-    // 1. Seleccionar el acelerómetro de alto rango.
     HAL_GPIO_WritePin(HIGHG_CS_GPIO_Port, HIGHG_CS_Pin, GPIO_PIN_RESET);
-    // 2. Enviar command y guardar el resultado en status.
     status = HAL_SPI_Transmit(spi, &command, 1, 5);
-    // 3. Solo si el envío ha ido bien, recibir len bytes
-    //    en bufp y actualizar status.
     if (status == HAL_OK)
     {
       status = HAL_SPI_Receive(spi, bufp, len, 5);
     }
 
-    // 4. Deseleccionar el acelerómetro de alto rango, aunque haya fallado algo.
+    // Liberar CS también si falla la transferencia.
     HAL_GPIO_WritePin(HIGHG_CS_GPIO_Port, HIGHG_CS_Pin, GPIO_PIN_SET);
-    // 5. Devolver 0 si todo ha ido bien; -1 si ha fallado.
     if (status == HAL_OK)
     {
       return 0;
@@ -592,31 +585,29 @@ static int32_t HIGHG_Read(void *handle, uint8_t reg,
     return -1;
 }
 
+// Escribe len bytes desde bufp en los registros del H3LIS331DL mediante SPI.
+// Devuelve 0 si funciona y -1 si falla.
 static int32_t HIGHG_Write(void *handle, uint8_t reg,
                            const uint8_t *bufp, uint16_t len)
 {
     SPI_HandleTypeDef *spi = (SPI_HandleTypeDef *)handle;
     uint8_t command = reg & ~(HIGHG_SPI_READ_BIT | HIGHG_SPI_MULTI_BIT);
+    // Activar el incremento de dirección si se escriben varios registros.
     if (len > 1)
     {
       command |= HIGHG_SPI_MULTI_BIT;
     }
     HAL_StatusTypeDef status;
 
-    // 1. Seleccionar el acelerómetro de alto rango.
     HAL_GPIO_WritePin(HIGHG_CS_GPIO_Port, HIGHG_CS_Pin, GPIO_PIN_RESET);
-    // 2. Enviar command y guardar el resultado en status.
     status = HAL_SPI_Transmit(spi, &command, 1, 5);
-    // 3. Solo si el envío ha ido bien, transmitir len bytes
-    //    en bufp y actualizar status.
     if (status == HAL_OK)
     {
       status = HAL_SPI_Transmit(spi, bufp, len, 5);
     }
 
-    // 4. Deseleccionar el acelerómetro de alto rango, aunque haya fallado algo.
+    // Liberar CS también si falla la transferencia.
     HAL_GPIO_WritePin(HIGHG_CS_GPIO_Port, HIGHG_CS_Pin, GPIO_PIN_SET);
-    // 5. Devolver 0 si todo ha ido bien; -1 si ha fallado.
     if (status == HAL_OK)
     {
       return 0;
@@ -624,17 +615,14 @@ static int32_t HIGHG_Write(void *handle, uint8_t reg,
     return -1;
 }
 
-// Devuelve 1 si se identifica el acelerómetro de alto rango esperado; 0 si falla la lectura o no coincide.
+// Comprueba WHO_AM_I del H3LIS331DL. Devuelve 1 si coincide; 0 si falla o es otro dispositivo.
 static int HIGHG_CheckIdentity(void)
 {
     uint8_t id = 0;
     int32_t status;
 
-    // Leer WHO_AM_I mediante la biblioteca de ST, que utiliza nuestra HIGHG_Read.
     status = h3lis331dl_device_id_get(&highg_ctx, &id);
 
-    // La biblioteca devuelve 0 cuando la lectura termina correctamente.
-    // Además, el identificador recibido debe coincidir con H3LIS331DL_ID (0x32).
     if (status == 0 && id == H3LIS331DL_ID)
     {
       return 1;
@@ -642,59 +630,56 @@ static int HIGHG_CheckIdentity(void)
     return 0;
 }
 
+// Configura los tres ejes a ±200 g y 400 Hz, sin filtro paso alto.
+// Devuelve 0 si se completan los ajustes y -1 si falla alguno.
 static int32_t HIGHG_Configure(void)
 {
     int32_t status;
 
-    // Detener las medidas mientras se configura el sensor.
+    // Detener las medidas mientras se aplican los ajustes.
     status = h3lis331dl_data_rate_set(&highg_ctx, H3LIS331DL_ODR_OFF);
     if (status != 0)
     {
         return -1;
     }
-    // Activar BDU.
+    // BDU mantiene coherentes los dos bytes de cada eje durante la lectura.
     status = h3lis331dl_block_data_update_set(&highg_ctx, PROPERTY_ENABLE);
     if (status != 0)
     {
         return -1;
     }
-    // Establecer el orden de los bytes, coloca el byte menos significativo en la dirección más baja.
+    // Colocar el byte menos significativo en la dirección más baja.
     status = h3lis331dl_data_format_set(&highg_ctx, H3LIS331DL_LSB_AT_LOW_ADD);
     if (status != 0)
     {
         return -1;
     }
-    // Desactivar el filtro paso alto.
     status = h3lis331dl_hp_path_set(&highg_ctx, H3LIS331DL_HP_DISABLE);
     if (status != 0)
     {
         return -1;
     }
-    // Seleccionar el rango de ±200 g.
     status = h3lis331dl_full_scale_set(&highg_ctx, H3LIS331DL_200g);
     if (status != 0)
     {
         return -1;
     }
-    // Habilitar el eje X.
     status = h3lis331dl_axis_x_data_set(&highg_ctx, PROPERTY_ENABLE);
     if (status != 0)
     {
         return -1;
     }
-    // Habilitar el eje Y.
     status = h3lis331dl_axis_y_data_set(&highg_ctx, PROPERTY_ENABLE);
     if (status != 0)
     {
         return -1;
     }
-    // Habilitar el eje Z.
     status = h3lis331dl_axis_z_data_set(&highg_ctx, PROPERTY_ENABLE);
     if (status != 0)
     {
         return -1;
     }
-    // Activar las medidas a la frecuencia escogida de 400 Hz.
+    // Activar las medidas después de configurar los tres ejes.
     status = h3lis331dl_data_rate_set(&highg_ctx, H3LIS331DL_ODR_400Hz);
     if (status != 0)
     {
@@ -704,67 +689,61 @@ static int32_t HIGHG_Configure(void)
     return 0;
 }
 
+// Espera el arranque, identifica y configura el acelerómetro de alto rango.
+// Devuelve 0 si queda inicializado y -1 si falla algún paso.
 static int32_t HIGHG_Init(void)
 {
-  // Esperar al arranque del sensor antes de iniciar la comunicación.
   HAL_Delay(HIGHG_BOOT_TIME_MS);
-  // Se comprueba la identificación del sensor
   highg_identified = HIGHG_CheckIdentity();
   if (highg_identified == 0)
   {
     return -1;
   }
-  // Se lleva a cabo la configuración del sensor.
   if (HIGHG_Configure() != 0)
   {
     return -1;
   }
-  // Si todos los pasos han sido correctos devuelve 0.
   return 0;
 }
 
+// Lee los tres ejes del acelerómetro de alto rango y los convierte a g.
+// Devuelve 1 con una muestra nueva, 0 si no hay datos nuevos y -1 si falla.
+// Solo actualiza el array de salida cuando la lectura termina correctamente.
 static int32_t HIGHG_ReadAcceleration(float acceleration_g[3])
 {
     uint8_t data_ready = 0;
     int16_t raw[3] = {0};
     int32_t status;
 
-    // 1. Consultar si hay una medida nueva.
-    //    Si falla la consulta, devolver -1.
     status = h3lis331dl_flag_data_ready_get(&highg_ctx, &data_ready);
     if (status != 0)
     {
         return -1;
     }
-    // 2. Si no hay una medida nueva, devolver 0.
     if (data_ready == 0)
     {
       return 0;
     }
-    // 3. Leer los tres ejes en raw.
-    //    Si falla la lectura, devolver -1.
     status = h3lis331dl_acceleration_raw_get(&highg_ctx, raw);
     if (status != 0)
     {
         return -1;
     }
-    // 4. Convertir cada eje a g y guardarlo en acceleration_g.
     for (int i = 0; i < 3; i++)
     {
       acceleration_g[i] = h3lis331dl_from_fs200_to_mg(raw[i]) / 1000.0f;
     }
-    // 5. Devolver 1 para indicar que se ha obtenido una medida nueva.
     return 1;
 }
 
+// Envía al AMS 5935 la orden de medición simple, sin esperar aquí la conversión.
+// Devuelve 0 si se envía correctamente y -1 si falla la comunicación.
 static int32_t BARO_StartMeasurement(void)
 {
     uint8_t command = BARO_CMD_SINGLE_MEASUREMENT;
     HAL_StatusTypeDef status;
 
-    // Enviar el comando por I2C1 y guardar el resultado en status.
     status = HAL_I2C_Master_Transmit(&hi2c1, BARO_I2C_ADDRESS_HAL, &command, 1, BARO_I2C_TIMEOUT_MS);
-    // Devolver 0 si el envío funciona; -1 si falla.
     if (status != HAL_OK)
     {
       return -1;
@@ -772,13 +751,13 @@ static int32_t BARO_StartMeasurement(void)
     return 0;
 }
 
+// Lee el byte de estado del AMS 5935 por I2C.
+// Devuelve 0 si se recibe y -1 si falla la comunicación; no interpreta sus bits.
 static int32_t BARO_ReadStatus(uint8_t *status_byte)
 {
     HAL_StatusTypeDef status;
 
-    // Leer un byte del barómetro y guardarlo donde apunta status_byte.
     status = HAL_I2C_Master_Receive(&hi2c1, BARO_I2C_ADDRESS_HAL, status_byte, 1, BARO_I2C_TIMEOUT_MS);
-    // Devolver -1 si falla la comunicación; 0 si funciona.
     if (status != HAL_OK)
     {
       return -1;
@@ -786,32 +765,33 @@ static int32_t BARO_ReadStatus(uint8_t *status_byte)
     return 0;
 }
 
+// Interpreta los bits fijos, el estado ocupado y los errores del barómetro.
+// Devuelve 1 si la medida está lista, 0 si sigue midiendo y -1 si detecta un error.
 static int32_t BARO_CheckStatus(uint8_t status_byte)
 {
-    // 1. Comprobar los bits fijos. Si no coinciden, devolver -1.
     if ((status_byte & BARO_STATUS_FIXED_MASK) != BARO_STATUS_FIXED_VALUE)
     {
       return -1;
     }
-    // 2. Si hay un error de memoria interna, devolver -1.
     if ((status_byte & BARO_STATUS_MEMORY_ERROR_BIT) != 0U)
     {
       return -1;
     }
-    // 3. Si sigue midiendo, devolver 0.
+    // Esperar al final de la conversión antes de evaluar el desbordamiento de señal.
     if ((status_byte & BARO_STATUS_BUSY_BIT) != 0U)
     {
       return 0;
     }
-    // 4. Con la medición terminada, si hay desbordamiento, devolver -1.
     if ((status_byte & BARO_STATUS_OVERFLOW_BIT) != 0U)
     {
       return -1;
     }
-    // 5. Devolver 1: medición terminada sin los errores comprobados.
     return 1;
 }
 
+// Recibe estado, presión y temperatura, y reconstruye las dos lecturas de 24 bits.
+// Devuelve 1 si publica las lecturas, 0 si el sensor sigue ocupado y -1 si falla.
+// Los punteros de salida deben apuntar a variables válidas.
 static int32_t BARO_ReadRaw(uint32_t *pressure_raw,
                            uint32_t *temperature_raw)
 {
@@ -819,33 +799,29 @@ static int32_t BARO_ReadRaw(uint32_t *pressure_raw,
     HAL_StatusTypeDef status;
     int32_t measurement_status;
 
-    // 1. Recibir los siete bytes mediante HAL_I2C_Master_Receive.
     status = HAL_I2C_Master_Receive(&hi2c1, BARO_I2C_ADDRESS_HAL, data, 7, BARO_I2C_TIMEOUT_MS);
-    // 2. Si falla la comunicación, devolver -1.
     if (status != HAL_OK)
     {
       return -1;
     }
-    // 3. Comprobar data[0] utilizando BARO_CheckStatus.
-    //    Guardar su resultado en measurement_status.
     measurement_status = BARO_CheckStatus(data[0]);
-    // 4. Si measurement_status no es 1, devolver ese resultado.
     if (measurement_status != 1)
     {
       return measurement_status;
     }
-    // 5. Construir los valores de presión y temperatura
-    //    y guardarlos mediante los punteros de salida.
+    // El primer byte es el estado; siguen presión y temperatura, con el byte mayor primero.
     *pressure_raw = ((uint32_t)data[1] << 16)
              | ((uint32_t)data[2] << 8)
              | (uint32_t)data[3];
     *temperature_raw = ((uint32_t)data[4] << 16)
              | ((uint32_t)data[5] << 8)
              | (uint32_t)data[6];
-    // 6. Devolver 1.
     return 1;
 }
 
+// Convierte las lecturas del AMS 5935-1500-A a hPa y °C.
+// Devuelve 1 con nuevas medidas, 0 si sigue ocupado y -1 si falla.
+// Solo modifica las salidas al obtener datos listos y sin los errores comprobados.
 static int32_t BARO_ReadMeasurements(float *pressure_hpa,
                                     float *temperature_c)
 {
@@ -853,49 +829,39 @@ static int32_t BARO_ReadMeasurements(float *pressure_hpa,
     uint32_t temperature_raw = 0;
     int32_t status;
 
-    // 1. Llamar a BARO_ReadRaw pasando las direcciones
-    //    de pressure_raw y temperature_raw.
     status = BARO_ReadRaw(&pressure_raw, &temperature_raw);
-    // 2. Si su resultado no es 1, devolver ese resultado.
     if (status != 1)
     {
       return status;
     }
-    // 3. Convertir pressure_raw a hPa y escribir
-    //    el resultado donde apunta pressure_hpa.
+    // El intervalo 0..1500 hPa corresponde al 10..90 % de la escala digital de 24 bits.
     *pressure_hpa = ((float)pressure_raw - 0.1f * BARO_DIGITAL_SCALE) / (0.8f * BARO_DIGITAL_SCALE) * BARO_PRESSURE_MAX_HPA;
-    // 4. Convertir temperature_raw a grados Celsius y escribir
-    //    el resultado donde apunta temperature_c.
+    // Temperatura del propio sensor, no una medida del aire exterior.
     *temperature_c = (float)temperature_raw / BARO_DIGITAL_SCALE * 165.0f - 40.0f;
-    // 5. Devolver 1.
     return 1;
 }
 
+// Inicia mediciones periódicas y recoge el resultado en llamadas posteriores.
+// Deja libre el bucle durante la conversión; las transferencias I2C sí son bloqueantes.
+// Actualiza estado y marca de tiempo; conserva la última medida si la nueva falla.
 static void BARO_Update(void)
 {
     uint32_t now = HAL_GetTick();
 
     if (baro_measurement_pending == 0)
     {
-        // 1. Si aún no han transcurrido BARO_PERIOD_MS
-        //    desde baro_last_request_ms, salir con return.
         if ((uint32_t)(now - baro_last_request_ms) < BARO_PERIOD_MS)
         {
           return;
         }
-        // 2. Guardar now en baro_last_request_ms.
+        // Espaciar también los reintentos cuando falla el envío de la orden.
         baro_last_request_ms = now;
-        // 3. Llamar a BARO_StartMeasurement.
-        //    Si falla, poner baro_measurement_status a -1 y salir.
         if (BARO_StartMeasurement() != 0)
         {
           baro_measurement_status = -1;
           return;
         }
-        // 4. Si funciona:
-        //    - Guardar HAL_GetTick() en baro_measurement_start_ms.
-        //    - Poner baro_measurement_pending a 1.
-        //    - Poner baro_measurement_status a 0.
+        // Contar la espera de conversión desde el final del envío de la orden.
         baro_measurement_start_ms = HAL_GetTick();
         baro_measurement_pending = 1;
         baro_measurement_status = 0;
@@ -904,17 +870,10 @@ static void BARO_Update(void)
     {
         uint8_t sensor_status = 0;
 
-        // 1. Si aún no han pasado BARO_CONVERSION_WAIT_MS
-        //    desde baro_measurement_start_ms, salir.
         if ((uint32_t)(now - baro_measurement_start_ms) < BARO_CONVERSION_WAIT_MS)
         {
           return;
         }
-        // 2. Leer el byte de estado con BARO_ReadStatus.
-        //    Si falla:
-        //    - Poner baro_measurement_status a -1.
-        //    - Poner baro_measurement_pending a 0.
-        //    - Salir.
         if (BARO_ReadStatus(&sensor_status) != 0)
         {
           baro_measurement_status = -1;
@@ -922,34 +881,22 @@ static void BARO_Update(void)
           return;
 
         }
-        // 3. Interpretar sensor_status con BARO_CheckStatus
-        //    y guardar el resultado en baro_measurement_status.
         baro_measurement_status = BARO_CheckStatus(sensor_status);
-        // 4. Si ese resultado es 1, llamar a BARO_ReadMeasurements
-        //    pasando las direcciones de baro_pressure_hpa
-        //    y baro_temperature_c.
-        //    Guardar su resultado en baro_measurement_status.
+        // Volver a validar el estado incluido en la lectura completa.
         if (baro_measurement_status == 1)
         {
           baro_measurement_status = BARO_ReadMeasurements(&baro_pressure_hpa, &baro_temperature_c);
         }
-        // 5. Si baro_measurement_status es 1,
-        //    actualizar baro_measurement_time_ms con HAL_GetTick().
         if (baro_measurement_status == 1)
         {
           baro_measurement_time_ms = HAL_GetTick();
         }
-        // 6. Si baro_measurement_status es distinto de 0:
-        //    - Poner baro_measurement_pending a 0.
-        //    - Salir.
         if (baro_measurement_status != 0)
         {
           baro_measurement_pending = 0;
           return;
         }
-        // 7. Si seguimos esperando y se ha alcanzado el timeout:
-        //    - Poner baro_measurement_status a -1.
-        //    - Poner baro_measurement_pending a 0.
+        // No mantener indefinidamente una conversión pendiente.
         if ((uint32_t)(HAL_GetTick() - baro_measurement_start_ms) >= BARO_MEASUREMENT_TIMEOUT_MS)
         {
           baro_measurement_status = -1;
@@ -957,6 +904,7 @@ static void BARO_Update(void)
         }
     }
 }
+
 // Inicia USART1 con DMA circular y avisos de recepción.
 // Devuelve 0 si se inicia y -1 si falla; la UART y el DMA deben estar configurados.
 static int32_t GNSS_StartReception(void)
